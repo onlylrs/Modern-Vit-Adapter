@@ -1,0 +1,8 @@
+**/__pycache__/
+work_dirs/
+my-configs/*
+!my-configs/coco2017_fasterrcnn_dinov3.py
+!my-configs/coco2017_maskrcnn_dinov3.py
+scripts/*
+!scripts/example.train.sh
+!scripts/example.test.sh

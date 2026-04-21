@@ -1,0 +1,4 @@
+# ninja log v7
+3	6307	1776576264741910000	/home/rliuar/1_Research/dinov3-adapter-research/detection/ops/build/temp.linux-x86_64-cpython-312/home/rliuar/1_Research/dinov3-adapter-research/detection/ops/src/cpu/ms_deform_attn_cpu.o	5e0f08dd132fc198
+7	17513	1776576264744872000	/home/rliuar/1_Research/dinov3-adapter-research/detection/ops/build/temp.linux-x86_64-cpython-312/home/rliuar/1_Research/dinov3-adapter-research/detection/ops/src/vision.o	669a341b9bff488b
+5	47533	1776576264743463000	/home/rliuar/1_Research/dinov3-adapter-research/detection/ops/build/temp.linux-x86_64-cpython-312/home/rliuar/1_Research/dinov3-adapter-research/detection/ops/src/cuda/ms_deform_attn_cuda.o	cbf96112df304cd5
