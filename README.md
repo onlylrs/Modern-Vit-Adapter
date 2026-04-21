@@ -21,7 +21,9 @@ micromamba install -c nvidia -c conda-forge cuda-nvcc=12.8
 ```
 Install relevant packages:
 ```bash
-pip install setuptools<82 wheel packaging ninja Cython addict pyyaml pillow yapf opencv-python-headless matplotlib six terminaltables timm numpy
+pip install -U pip
+pip install "setuptools<82" wheel packaging ninja Cython
+pip install addict pyyaml pillow yapf opencv-python-headless matplotlib six terminaltables timm numpy
 ```
 
 Compile mmcv:
@@ -97,7 +99,12 @@ PY
 The installation should be smooth. Post an issue if encoutering any problems with installation.
 
 # Train and test
-The usage is exactly the same with the original ViT-Adapter project, see [detection/README.md](detection/README.md) and [segmentation/README.md](segmentation/README.md). 
+**Important:** To activate the environment, you must perform *both* of the following steps **every time**:
+
+1. Use your environment manager to activate the environment (for example: `micromamba activate torch29`).
+2. Run `source env.sh` to link to mmcv, mmdet and mmseg.
+
+For training and testing, the usage is exactly the same with the original ViT-Adapter project, see [detection/README.md](detection/README.md) and [segmentation/README.md](segmentation/README.md). 
 Apart from the original usage, we also support the DINOv3 backbone. Please refer to [scripts/example.train.sh](scripts/example.train.sh) and [scripts/example.test.sh](scripts/example.test.sh).
 
 # Todo

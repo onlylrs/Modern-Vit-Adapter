@@ -94,7 +94,7 @@ class InteractionBlockWithCls(nn.Module):
                 )
         return x, c
 
-# ViT-Adapter adapter of dinov3
+# ViT-Adapter style adapter of dinov3
 class LocalInteractionBlockWithCls(nn.Module):
     def __init__(
         self,
