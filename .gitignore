@@ -6,3 +6,6 @@ my-configs/*
 scripts/*
 !scripts/example.train.sh
 !scripts/example.test.sh
+detection/configs/maskdino/*
+!maskdino_r50_8x2_50e_coco_instance.py
+!maskdino_r50_50e_coco_panoptic.py
