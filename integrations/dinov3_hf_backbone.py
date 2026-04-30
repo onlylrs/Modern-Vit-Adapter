@@ -29,6 +29,10 @@ class OfficialDINOv3Backbone(nn.Module):
     def forward(self, pixel_values: torch.Tensor):
         return self.model(pixel_values=pixel_values)
 
+    @property
+    def num_prefix_tokens(self) -> int:
+        return 1 + self.n_storage_tokens
+
     @staticmethod
     def _resolve_layers(model: nn.Module):
         if hasattr(model, "layer"):
@@ -36,6 +40,28 @@ class OfficialDINOv3Backbone(nn.Module):
         if hasattr(model, "model") and hasattr(model.model, "layer"):
             return model.model.layer
         raise AttributeError(f"{type(model).__name__} does not expose transformer layers")
+
+    def prepare_tokens(self, x: torch.Tensor):
+        hidden_states = self.model.embeddings(pixel_values=x)
+        position_embeddings = self.model.rope_embeddings(x)
+        return hidden_states, position_embeddings
+
+    def run_layers(self, hidden_states: torch.Tensor, position_embeddings: torch.Tensor, start: int, end: int):
+        if end < start:
+            return hidden_states
+        if start < 0 or end >= self.n_blocks:
+            raise ValueError(f"Invalid DINOv3 layer range [{start}, {end}] for {self.n_blocks} blocks")
+        for idx in range(start, end + 1):
+            hidden_states = self.layers[idx](hidden_states, position_embeddings=position_embeddings)
+        return hidden_states
+
+    def split_tokens(self, hidden_states: torch.Tensor, norm: bool = True):
+        if norm:
+            hidden_states = self.model.norm(hidden_states)
+        class_token = hidden_states[:, 0]
+        extra_tokens = hidden_states[:, 1 : self.n_storage_tokens + 1]
+        patch_tokens = hidden_states[:, self.n_storage_tokens + 1 :]
+        return patch_tokens, class_token, extra_tokens
 
     def get_intermediate_layers(
         self,
@@ -96,3 +122,20 @@ def normalize_interaction_indexes(interaction_indexes):
         else:
             normalized.append(int(item))
     return normalized
+
+
+def normalize_interaction_ranges(interaction_indexes):
+    ranges = []
+    next_start = 0
+    for item in interaction_indexes:
+        if isinstance(item, (list, tuple)):
+            if not item:
+                raise ValueError("interaction index group cannot be empty")
+            start, end = int(item[0]), int(item[-1])
+        else:
+            start, end = next_start, int(item)
+        if start < 0 or end < start:
+            raise ValueError(f"invalid interaction index range: [{start}, {end}]")
+        ranges.append((start, end))
+        next_start = end + 1
+    return ranges
