@@ -7,11 +7,13 @@ except KeyError:
     CustomizedTextLoggerHook = None
 from .early_stopping_hook import EarlyStoppingHook
 from .layer_decay_optimizer_constructor import LayerDecayOptimizerConstructor
+from .maskdino_optimizer_constructor import MaskDINOOptimizerConstructor
 from .my_checkpoint import my_load_checkpoint
 from .reliable_eval_hook import ReliableEvalHook
 
 __all__ = [
     'LayerDecayOptimizerConstructor',
+    'MaskDINOOptimizerConstructor',
     'EarlyStoppingHook',
     'ReliableEvalHook',
     'load_checkpoint', 'my_load_checkpoint'
