@@ -113,5 +113,5 @@ Apart from the original usage, we also support the DINOv3 backbone. Please refer
 # Todo
 - [ ] Support DINOv2 backbone
 - [ ] Support [ViT-CoMer](https://github.com/Traffic-X/ViT-CoMer) - another excellent adapter designed for ViT-based backbones
-- [ ] Support [MaskDINO](https://github.com/IDEA-Research/MaskDINO) - a solid task head for detection and segmentation. 
+- [x] Support [MaskDINO](https://github.com/IDEA-Research/MaskDINO) - a solid task head for detection and segmentation. 
 
