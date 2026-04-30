@@ -6,7 +6,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_DETECTION_EXPERIMENT = REPO_ROOT / "work_dirs/detection/coco2017_fasterrcnn_dinov3_local_interaction"
+DEFAULT_DETECTION_EXPERIMENT = REPO_ROOT / "work_dirs/detection/coco2017_fasterrcnn_dinov3_vit_adapter"
 DEFAULT_SEGMENTATION_EXPERIMENT = REPO_ROOT / "work_dirs/segmentation/coco2017_maskrcnn_dinov3_official_adapter"
 
 

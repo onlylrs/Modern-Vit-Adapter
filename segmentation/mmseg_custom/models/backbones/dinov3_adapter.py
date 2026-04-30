@@ -12,7 +12,11 @@ from ops.modules import MSDeformAttn
 from timm.models.layers import trunc_normal_
 from torch.nn.init import normal_
 
-from integrations.dinov3_hf_backbone import OfficialDINOv3Backbone, normalize_interaction_indexes
+from integrations.dinov3_hf_backbone import (
+    OfficialDINOv3Backbone,
+    normalize_interaction_indexes,
+    normalize_interaction_ranges,
+)
 
 from .adapter_modules import Extractor, Injector, SpatialPriorModule, deform_inputs
 
@@ -95,7 +99,7 @@ class InteractionBlockWithCls(nn.Module):
         return x, c
 
 
-class LocalInteractionBlockWithCls(nn.Module):
+class ViTAdapterInteractionBlockWithCls(nn.Module):
     def __init__(
         self,
         dim,
@@ -156,8 +160,21 @@ class LocalInteractionBlockWithCls(nn.Module):
         else:
             self.extra_extractors = None
 
-    def forward(self, x, c, cls, deform_inputs1, deform_inputs2, h_c, w_c, h_toks, w_toks):
-        del cls, h_toks, w_toks
+    def forward(
+        self,
+        x,
+        c,
+        prefix_tokens,
+        blocks,
+        position_embeddings,
+        deform_inputs1,
+        deform_inputs2,
+        h_c,
+        w_c,
+        h_toks,
+        w_toks,
+    ):
+        del h_toks, w_toks
         x = self.injector(
             query=x,
             reference_points=deform_inputs1[0],
@@ -165,6 +182,11 @@ class LocalInteractionBlockWithCls(nn.Module):
             spatial_shapes=deform_inputs1[1],
             level_start_index=deform_inputs1[2],
         )
+        prefix_len = prefix_tokens.shape[1]
+        x = torch.cat((prefix_tokens, x), dim=1)
+        for block in blocks:
+            x = block(x, position_embeddings=position_embeddings)
+        prefix_tokens, x = x[:, :prefix_len, :], x[:, prefix_len:, :]
         c = self.extractor(
             query=c,
             reference_points=deform_inputs2[0],
@@ -185,7 +207,7 @@ class LocalInteractionBlockWithCls(nn.Module):
                     H=h_c,
                     W=w_c,
                 )
-        return x, c
+        return x, c, prefix_tokens
 
 
 @BACKBONES.register_module()
@@ -222,6 +244,12 @@ class ViTAdapterDINOv3Seg(nn.Module):
 
         self.pretrain_size = (pretrain_size, pretrain_size)
         self.interaction_indexes = normalize_interaction_indexes(interaction_indexes or [])
+        self.interaction_ranges = normalize_interaction_ranges(interaction_indexes or [])
+        if self.interaction_indexes and max(self.interaction_indexes) >= self.backbone.n_blocks:
+            raise ValueError(
+                f"interaction_indexes must be within DINOv3 depth {self.backbone.n_blocks}: "
+                f"{interaction_indexes}"
+            )
         self.add_vit_feature = add_vit_feature
         self.adapter_mode = adapter_mode
 
@@ -309,8 +337,8 @@ class ViTAdapterDINOv3Seg(nn.Module):
     def _interaction_block_cls(adapter_mode):
         if adapter_mode == "official_adapter":
             return InteractionBlockWithCls
-        if adapter_mode == "local_interaction":
-            return LocalInteractionBlockWithCls
+        if adapter_mode == "vit_adapter":
+            return ViTAdapterInteractionBlockWithCls
         raise ValueError(f"Unsupported adapter_mode: {adapter_mode}")
 
     def train(self, mode=True):
@@ -328,6 +356,22 @@ class ViTAdapterDINOv3Seg(nn.Module):
 
         h_c, w_c = x.shape[2] // 16, x.shape[3] // 16
         h_toks, w_toks = x.shape[2] // self.patch_size, x.shape[3] // self.patch_size
+
+        if self.adapter_mode == "vit_adapter":
+            return self._forward_vit_adapter(
+                x,
+                c1,
+                c2,
+                c3,
+                c4,
+                c,
+                deform_inputs1,
+                deform_inputs2,
+                h_c,
+                w_c,
+                h_toks,
+                w_toks,
+            )
 
         backbone_ctx = torch.no_grad() if self.freeze_backbone else torch.enable_grad()
         with backbone_ctx:
@@ -356,6 +400,74 @@ class ViTAdapterDINOv3Seg(nn.Module):
                 w_toks,
             )
             outs.append(patch_tokens.transpose(1, 2).view(bs, dim, h_toks, w_toks).contiguous())
+
+        c2_len, c3_len, c4_len = c2.size(1), c3.size(1), c4.size(1)
+        c2 = c[:, 0:c2_len, :]
+        c3 = c[:, c2_len:c2_len + c3_len, :]
+        c4 = c[:, c2_len + c3_len:c2_len + c3_len + c4_len, :]
+
+        c2 = c2.transpose(1, 2).view(bs, dim, h_c * 2, w_c * 2).contiguous()
+        c3 = c3.transpose(1, 2).view(bs, dim, h_c, w_c).contiguous()
+        c4 = c4.transpose(1, 2).view(bs, dim, h_c // 2, w_c // 2).contiguous()
+        c1 = self.up(c2) + c1
+
+        if self.add_vit_feature:
+            x1, x2, x3, x4 = outs
+            x1 = F.interpolate(x1, size=(4 * h_c, 4 * w_c), mode="bilinear", align_corners=False)
+            x2 = F.interpolate(x2, size=(2 * h_c, 2 * w_c), mode="bilinear", align_corners=False)
+            x3 = F.interpolate(x3, size=(h_c, w_c), mode="bilinear", align_corners=False)
+            x4 = F.interpolate(x4, size=(h_c // 2, w_c // 2), mode="bilinear", align_corners=False)
+            c1, c2, c3, c4 = c1 + x1, c2 + x2, c3 + x3, c4 + x4
+
+        f1 = self.norm1(c1)
+        f2 = self.norm2(c2)
+        f3 = self.norm3(c3)
+        f4 = self.norm4(c4)
+        return [f1, f2, f3, f4]
+
+    def _forward_vit_adapter(
+        self,
+        x,
+        c1,
+        c2,
+        c3,
+        c4,
+        c,
+        deform_inputs1,
+        deform_inputs2,
+        h_c,
+        w_c,
+        h_toks,
+        w_toks,
+    ):
+        hidden_states, position_embeddings = self.backbone.prepare_tokens(x)
+        bs, _, dim = hidden_states.shape
+        prefix_len = self.backbone.num_prefix_tokens
+        next_layer = 0
+
+        outs = []
+        for (start, end), layer in zip(self.interaction_ranges, self.interactions):
+            if start > next_layer:
+                hidden_states = self.backbone.run_layers(hidden_states, position_embeddings, next_layer, start - 1)
+            prefix_tokens = hidden_states[:, :prefix_len, :]
+            patch_tokens = hidden_states[:, prefix_len:, :]
+            blocks = self.backbone.layers[start : end + 1]
+            patch_tokens, c, prefix_tokens = layer(
+                patch_tokens,
+                c,
+                prefix_tokens,
+                blocks,
+                position_embeddings,
+                deform_inputs1,
+                deform_inputs2,
+                h_c,
+                w_c,
+                h_toks,
+                w_toks,
+            )
+            hidden_states = torch.cat((prefix_tokens, patch_tokens), dim=1)
+            outs.append(patch_tokens.transpose(1, 2).view(bs, dim, h_toks, w_toks).contiguous())
+            next_layer = end + 1
 
         c2_len, c3_len, c4_len = c2.size(1), c3.size(1), c4.size(1)
         c2 = c[:, 0:c2_len, :]
