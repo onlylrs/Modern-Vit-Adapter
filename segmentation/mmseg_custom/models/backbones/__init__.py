@@ -5,7 +5,8 @@ from .dinov3_adapter import DINOv3SegAdapter, ViTAdapterDINOv3Seg
 from .uniperceiver_adapter import UniPerceiverAdapter
 from .vit_adapter import ViTAdapter
 from .vit_baseline import ViTBaseline
+from .vit_comer import ViTCoMer
 
 __all__ = ['ViTBaseline', 'ViTAdapter', 'BEiTAdapter',
            'BEiTBaseline', 'UniPerceiverAdapter',
-           'ViTAdapterDINOv3Seg', 'DINOv3SegAdapter']
+           'ViTAdapterDINOv3Seg', 'DINOv3SegAdapter', 'ViTCoMer']
