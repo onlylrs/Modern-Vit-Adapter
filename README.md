@@ -6,6 +6,8 @@ The versions mmcv==1.4.2, mmdet==2.22.0, and mmseg==0.20.2 are kept, with compat
 
 **News🔥**
 
+`2026-05-03` Added support for [ViT-CoMer](https://github.com/Traffic-X/ViT-CoMer) and [ViT-Split](https://github.com/JackYFL/ViT-Split).
+
 `2026-04-30` Added support for [MaskDINO](https://github.com/IDEA-Research/MaskDINO) and two adapters for [DINOv3](https://github.com/facebookresearch/dinov3). See [Release v1.1.0](https://github.com/onlylrs/Modern-Vit-Adapter/releases/tag/v1.1.0).
 
 # Installation
@@ -108,7 +110,7 @@ The installation should be smooth. Feel free to post an issue if encoutering any
 2. Run `source env.sh` to link to mmcv, mmdet and mmseg.
 
 For training and testing, the usage is exactly the same with the original ViT-Adapter project, see [detection/README.md](detection/README.md) and [segmentation/README.md](segmentation/README.md). 
-Apart from the original usage, we also support the DINOv3 backbone. Please refer to [scripts/example.train.sh](scripts/example.train.sh) and [scripts/example.test.sh](scripts/example.test.sh).
+Apart from the original usage, we also support the DINOv3 backbones. Please refer to [scripts/example.train.sh](scripts/example.train.sh) and [scripts/example.test.sh](scripts/example.test.sh).
 
 # Todo
 - [ ] Support [ViT-CoMer](https://github.com/Traffic-X/ViT-CoMer) - another excellent adapter designed for ViT-based backbones
