@@ -7,10 +7,44 @@
 
 import datetime
 from collections import OrderedDict
+import os.path as osp
 
 import mmcv
 import torch
+from mmcv.fileio.file_client import FileClient
 from mmcv.runner import HOOKS, TextLoggerHook
+
+
+@HOOKS.register_module()
+class PrintLrGroupHook(TextLoggerHook):
+    """Source: ViT-Split customized_text.py; prints initial LR groups."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def before_run(self, runner):
+        super(TextLoggerHook, self).before_run(runner)
+
+        if self.out_dir is not None:
+            self.file_client = FileClient.infer_client(self.file_client_args,
+                                                       self.out_dir)
+            basename = osp.basename(runner.work_dir.rstrip(osp.sep))
+            self.out_dir = self.file_client.join_path(self.out_dir, basename)
+            runner.logger.info(
+                (f'Text logs will be saved to {self.out_dir} by '
+                 f'{self.file_client.name} after the training process.'))
+
+        self.start_iter = runner.iter
+        self.json_log_path = osp.join(runner.work_dir,
+                                      f'{runner.timestamp}.log.json')
+        if runner.meta is not None:
+            self._dump_log(runner.meta, runner)
+
+        param2name = {id(param): name for name, param in runner.model.named_parameters()}
+        runner.logger.info('Initial learning rates for parameter groups: ')
+        for i, param_group in enumerate(runner.optimizer.param_groups):
+            names = [param2name.get(id(param), 'unknown') for param in param_group.get('params', [])]
+            runner.logger.info(f"Group {i} (first_param: {names[0] if names else 'none'}): {param_group['lr']}")
 
 
 @HOOKS.register_module()
