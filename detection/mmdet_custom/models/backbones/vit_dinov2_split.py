@@ -101,8 +101,15 @@ def _load_dinov2(backbone_size: str, register_version: bool):
     }
     backbone_arch = backbone_archs[register_version][backbone_size]
     backbone_name = f'dinov2_{backbone_arch}'
+    validate_repo = getattr(torch.hub, '_validate_not_a_forked_repo', None)
     torch.hub._validate_not_a_forked_repo = lambda a, b, c: True
-    return torch.hub.load(repo_or_dir='facebookresearch/dinov2', model=backbone_name)
+    try:
+        return torch.hub.load(repo_or_dir='facebookresearch/dinov2', model=backbone_name)
+    finally:
+        if validate_repo is None:
+            del torch.hub._validate_not_a_forked_repo
+        else:
+            torch.hub._validate_not_a_forked_repo = validate_repo
 
 
 @BACKBONES.register_module()

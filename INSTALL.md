@@ -89,4 +89,4 @@ print("MSDeformAttn import ok:", MSDeformAttn)
 PY
 ```
 
-The installation should be smooth. Feel free to post an issue if encoutering any problems.
+The installation should be smooth. Feel free to post an issue if encountering any problems.
