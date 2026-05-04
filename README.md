@@ -1,5 +1,7 @@
 # Modern ViT-Adapter
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/onlylrs/Modern-Vit-Adapter/blob/main/LICENSE) [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://github.com/onlylrs/Modern-Vit-Adapter/blob/main/INSTALL.md) [![PyTorch](https://img.shields.io/badge/PyTorch-2.9%20%28CUDA%2012.8%29-ee4c2c.svg)](https://pytorch.org/) [![Release](https://img.shields.io/github/v/release/onlylrs/Modern-Vit-Adapter?label=release)](https://github.com/onlylrs/Modern-Vit-Adapter/releases)
+
 Built on the [ViT-Adapter](https://arxiv.org/abs/2205.08534) architecture, this project modernizes the original codebase for PyTorch 2.x+ with easy installation. 
 
 The versions mmcv==1.4.2, mmdet==2.22.0, and mmseg==0.20.2 are kept, with compatibility updates for the latest PyTorch. See the log of these fixes [here](third_party/README.md).
