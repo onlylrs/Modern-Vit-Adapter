@@ -1,6 +1,7 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 from .beit_adapter import BEiTAdapter
 from .dinov3_adapter import DINOv3Adapter, ViTAdapterDINOv3
+from .dinov3_comer import DINOv3CoMer, ViTCoMerDINOv3
 from .dinov3_split import DINOv3SplitFusion
 from .uniperceiver_adapter import UniPerceiverAdapter
 from .vit_adapter import ViTAdapter
@@ -15,6 +16,8 @@ __all__ = [
     'BEiTAdapter',
     'ViTAdapterDINOv3',
     'DINOv3Adapter',
+    'ViTCoMerDINOv3',
+    'DINOv3CoMer',
     'ViTCoMer',
     'DINOViTSplitFusion',
     'DINOViTSplitLearnableGate',
