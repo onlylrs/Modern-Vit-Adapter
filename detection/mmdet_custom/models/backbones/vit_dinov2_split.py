@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import itertools
 import math
+import re
 from functools import partial
 
 import torch
@@ -94,7 +95,26 @@ class LearnableGate(torch.nn.Module):
         return gates
 
 
-def _load_dinov2(backbone_size: str, register_version: bool):
+def _extract_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+    for key in ('state_dict', 'model', 'teacher', 'student'):
+        if key in checkpoint and isinstance(checkpoint[key], dict):
+            return checkpoint[key]
+    return checkpoint
+
+
+def _normalize_dinov2_state_dict(state_dict):
+    normalized = {}
+    for key, value in state_dict.items():
+        key = key.removeprefix('module.')
+        key = key.removeprefix('backbone.')
+        key = re.sub(r'^blocks\.\d+\.(\d+)\.', r'blocks.\1.', key)
+        normalized[key] = value
+    return normalized
+
+
+def _load_dinov2(backbone_size: str, register_version: bool, pretrained=None, pretrained_img_size=None):
     backbone_archs = {
         False: dict(small='vits14', base='vitb14', large='vitl14', giant='vitg14'),
         True: dict(small='vits14_reg', base='vitb14_reg', large='vitl14_reg', giant='vitg14_reg'),
@@ -103,13 +123,27 @@ def _load_dinov2(backbone_size: str, register_version: bool):
     backbone_name = f'dinov2_{backbone_arch}'
     validate_repo = getattr(torch.hub, '_validate_not_a_forked_repo', None)
     torch.hub._validate_not_a_forked_repo = lambda a, b, c: True
+    hub_kwargs = {}
+    if pretrained is not None:
+        hub_kwargs['pretrained'] = False
+    if pretrained_img_size is not None:
+        hub_kwargs['img_size'] = pretrained_img_size
     try:
-        return torch.hub.load(repo_or_dir='facebookresearch/dinov2', model=backbone_name)
+        backbone = torch.hub.load(repo_or_dir='facebookresearch/dinov2', model=backbone_name, **hub_kwargs)
     finally:
         if validate_repo is None:
             del torch.hub._validate_not_a_forked_repo
         else:
             torch.hub._validate_not_a_forked_repo = validate_repo
+    if pretrained is not None:
+        checkpoint = torch.load(pretrained, map_location='cpu')
+        state_dict = _normalize_dinov2_state_dict(_extract_state_dict(checkpoint))
+        incompatible = backbone.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                'DINOv2 checkpoint is incompatible with the requested ViT-Split backbone: '
+                f'missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}')
+    return backbone
 
 
 @BACKBONES.register_module()
@@ -127,6 +161,8 @@ class DINOViTSplitFusion(BaseModule):
         select_layers=None,
         channels=384,
         tuning_type='frozen',
+        pretrained=None,
+        pretrained_img_size=None,
         output_orgimg=False,
         drop_path_rate=0,
         drop_path_uniform=False,
@@ -139,7 +175,7 @@ class DINOViTSplitFusion(BaseModule):
         self.register_version = register_version
         self.channels = channels
 
-        backbone_model = _load_dinov2(backbone_size, register_version)
+        backbone_model = _load_dinov2(backbone_size, register_version, pretrained, pretrained_img_size)
         if register_version:
             self.num_register_tokens = backbone_model.num_register_tokens
 
@@ -179,6 +215,8 @@ class DINOViTSplitFusion(BaseModule):
             for param in backbone_model.register_tokens:
                 param.requires_grad = True
 
+        self.detach_split_activations = not any(param.requires_grad for param in backbone_model.parameters())
+
         self.backbone = backbone_model
         frozen_out_dim = channels
         self.frozen_conv = nn.Sequential(
@@ -216,7 +254,7 @@ class DINOViTSplitFusion(BaseModule):
     @property
     def get_activation(self):
         def hook(model, input, output):
-            self.split_activations = output.detach()
+            self.split_activations = output.detach() if self.detach_split_activations else output
         return hook
 
     def reshape_vit_tokens(self, x, norm=True):
