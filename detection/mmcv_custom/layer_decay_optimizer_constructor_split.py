@@ -23,6 +23,12 @@ def get_num_layer_for_vit(var_name, num_max_layer):
         except Exception:
             return 0
         return layer_id + 1
+    if var_name.startswith('backbone.backbone.blocks.'):
+        try:
+            layer_id = int(var_name.split('.')[3])
+        except Exception:
+            return 0
+        return layer_id + 1
     return num_max_layer - 1
 
 
