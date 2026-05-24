@@ -24,7 +24,7 @@ Compile mmcv:
 export CUDA_HOME="$HOME/micromamba/envs/torch29"
 export PATH="$CUDA_HOME/bin:$PATH"
 export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
-
+export MMCV_WITH_OPS=1
 cd third_party/openmmlab/mmcv
 python setup.py build_ext --inplace
 
