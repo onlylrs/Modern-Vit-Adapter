@@ -40,6 +40,8 @@ covers most modern GPUs (A100, RTX 30xx, Ada, H100). Pick only those you need or
 
 Test mmcv:
 ```bash
+cd Modern-Vit-Adapter
+source env.sh
 python - <<'PY'
 import sys
 sys.path.insert(0, ".")
