@@ -16,7 +16,7 @@ Install relevant packages:
 ```bash
 pip install -U pip
 pip install "setuptools<82" wheel packaging ninja Cython
-pip install addict pyyaml pillow yapf opencv-python-headless matplotlib six terminaltables timm numpy
+pip install addict pyyaml pillow yapf opencv-python-headless matplotlib six terminaltables timm numpy scipy pycocotools transformers
 ```
 
 Compile mmcv:
