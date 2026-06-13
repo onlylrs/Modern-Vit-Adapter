@@ -95,6 +95,12 @@ def train_detector(model,
 
     runner_type = 'EpochBasedRunner' if 'runner' not in cfg else cfg.runner[
         'type']
+    dataloader_kwargs = dict(
+        pin_memory=cfg.data.get('pin_memory', False),
+        persistent_workers=cfg.data.get('persistent_workers', False))
+    if cfg.data.get('prefetch_factor', None) is not None:
+        dataloader_kwargs['prefetch_factor'] = cfg.data.prefetch_factor
+
     data_loaders = [
         build_dataloader(
             ds,
@@ -105,7 +111,7 @@ def train_detector(model,
             dist=distributed,
             seed=cfg.seed,
             runner_type=runner_type,
-            persistent_workers=cfg.data.get('persistent_workers', False))
+            **dataloader_kwargs)
         for ds in dataset
     ]
 
@@ -186,7 +192,8 @@ def train_detector(model,
             samples_per_gpu=val_samples_per_gpu,
             workers_per_gpu=cfg.data.workers_per_gpu,
             dist=distributed,
-            shuffle=False)
+            shuffle=False,
+            **dataloader_kwargs)
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
         eval_hook = DistEvalHook if distributed else EvalHook

@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import hashlib
+import os
 import os.path as osp
 
 import mmcv
@@ -37,11 +39,44 @@ class LoadImageFromFile:
     def __init__(self,
                  to_float32=False,
                  color_type='color',
-                 file_client_args=dict(backend='disk')):
+                 file_client_args=dict(backend='disk'),
+                 local_cache_dir=None):
         self.to_float32 = to_float32
         self.color_type = color_type
         self.file_client_args = file_client_args.copy()
+        if local_cache_dir is None:
+            local_cache_dir = os.environ.get('MMDET_LOCAL_IMAGE_CACHE') or None
+        if local_cache_dir is not None and self.file_client_args.get(
+                'backend', 'disk') != 'disk':
+            raise ValueError('local_cache_dir only supports disk FileClient')
+        self.local_cache_dir = local_cache_dir
         self.file_client = None
+
+    def _cache_path(self, filename):
+        digest = hashlib.sha1(filename.encode('utf-8')).hexdigest()
+        return osp.join(self.local_cache_dir, digest[:2], digest)
+
+    def _get_image_bytes(self, filename):
+        if self.local_cache_dir is None:
+            return self.file_client.get(filename)
+
+        cache_path = self._cache_path(filename)
+        if osp.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                return f.read()
+
+        img_bytes = self.file_client.get(filename)
+        cache_dir = osp.dirname(cache_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp_path = f'{cache_path}.tmp.{os.getpid()}'
+        try:
+            with open(tmp_path, 'wb') as f:
+                f.write(img_bytes)
+            os.replace(tmp_path, cache_path)
+        finally:
+            if osp.exists(tmp_path):
+                os.remove(tmp_path)
+        return img_bytes
 
     def __call__(self, results):
         """Call functions to load image and get image meta information.
@@ -62,7 +97,7 @@ class LoadImageFromFile:
         else:
             filename = results['img_info']['filename']
 
-        img_bytes = self.file_client.get(filename)
+        img_bytes = self._get_image_bytes(filename)
         img = mmcv.imfrombytes(img_bytes, flag=self.color_type)
         if self.to_float32:
             img = img.astype(np.float32)
@@ -79,7 +114,8 @@ class LoadImageFromFile:
         repr_str = (f'{self.__class__.__name__}('
                     f'to_float32={self.to_float32}, '
                     f"color_type='{self.color_type}', "
-                    f'file_client_args={self.file_client_args})')
+                    f'file_client_args={self.file_client_args}, '
+                    f'local_cache_dir={self.local_cache_dir})')
         return repr_str
 
 

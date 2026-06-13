@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -326,32 +327,46 @@ def _bootstrap_coco_resample(gt_dataset, predictions, sampled_image_ids):
     remapped_predictions = []
     next_ann_id = 1
     for idx, old_image_id in enumerate(sampled_image_ids, start=1):
-        base_img = copy.deepcopy(images_by_id[int(old_image_id)])
+        base_img = dict(images_by_id[int(old_image_id)])
         base_img["id"] = idx
         remapped_images.append(base_img)
 
         for ann in anns_by_image.get(int(old_image_id), []):
-            new_ann = copy.deepcopy(ann)
+            new_ann = dict(ann)
             new_ann["id"] = next_ann_id
             next_ann_id += 1
             new_ann["image_id"] = idx
             remapped_annotations.append(new_ann)
 
         for pred in preds_by_image.get(int(old_image_id), []):
-            new_pred = copy.deepcopy(pred)
+            new_pred = dict(pred)
             new_pred["image_id"] = idx
             remapped_predictions.append(new_pred)
 
     remapped_gt = {
         "images": remapped_images,
         "annotations": remapped_annotations,
-        "categories": copy.deepcopy(gt_dataset.get("categories", [])),
+        "categories": list(gt_dataset.get("categories", [])),
     }
     if "info" in gt_dataset:
-        remapped_gt["info"] = copy.deepcopy(gt_dataset["info"])
+        remapped_gt["info"] = dict(gt_dataset["info"])
     if "licenses" in gt_dataset:
-        remapped_gt["licenses"] = copy.deepcopy(gt_dataset["licenses"])
+        remapped_gt["licenses"] = list(gt_dataset["licenses"])
     return remapped_gt, remapped_predictions
+
+
+def _evaluate_coco_bootstrap_sample(args):
+    (gt_dataset, predictions, sampled_ids, iou_type, include_ap30,
+     include_mar) = args
+    resampled_gt, resampled_preds = _bootstrap_coco_resample(
+        gt_dataset, predictions, sampled_ids)
+    return _evaluate_coco_metric_set(
+        gt_dataset=resampled_gt,
+        predictions=resampled_preds,
+        iou_type=iou_type,
+        include_ap30=include_ap30,
+        include_mar=include_mar,
+    )
 
 
 def bootstrap_ci_from_coco_predictions(
@@ -363,6 +378,7 @@ def bootstrap_ci_from_coco_predictions(
     include_ap30=False,
     include_mar=False,
     progress_label=None,
+    n_jobs=1,
 ):
     image_ids = [int(img["id"]) for img in gt_dataset.get("images", [])]
     if not image_ids:
@@ -388,16 +404,22 @@ def bootstrap_ci_from_coco_predictions(
     rng = np.random.default_rng(seed)
     n_images = len(image_ids)
     progress_step = max(1, n_resamples // 10)
-    for sample_idx in range(n_resamples):
-        sampled_ids = [image_ids[int(i)] for i in rng.integers(0, n_images, size=n_images)]
-        resampled_gt, resampled_preds = _bootstrap_coco_resample(gt_dataset, predictions, sampled_ids)
-        sample_metrics = _evaluate_coco_metric_set(
-            gt_dataset=resampled_gt,
-            predictions=resampled_preds,
-            iou_type=iou_type,
-            include_ap30=include_ap30,
-            include_mar=include_mar,
-        )
+    sampled_ids_list = [
+        [image_ids[int(i)] for i in rng.integers(0, n_images, size=n_images)]
+        for _ in range(n_resamples)
+    ]
+    sample_args = [
+        (gt_dataset, predictions, sampled_ids, iou_type, include_ap30,
+         include_mar) for sampled_ids in sampled_ids_list
+    ]
+    if n_jobs is None or int(n_jobs) <= 1:
+        sample_metrics_iter = map(_evaluate_coco_bootstrap_sample, sample_args)
+    else:
+        with ProcessPoolExecutor(max_workers=int(n_jobs)) as executor:
+            sample_metrics_iter = executor.map(
+                _evaluate_coco_bootstrap_sample, sample_args)
+
+    for sample_idx, sample_metrics in enumerate(sample_metrics_iter):
         for name in metric_names:
             bootstrap_samples[name].append(float(sample_metrics[name]))
         if progress_label and (
@@ -903,6 +925,7 @@ def evaluate_detection_experiment(
     python_executable=None,
     bootstrap_resamples=1000,
     bootstrap_seed=42,
+    bootstrap_jobs=1,
 ):
     experiment_dir = Path(experiment_dir)
     config_path = Path(config_path) if config_path else _infer_detection_config(experiment_dir)
@@ -952,6 +975,7 @@ def evaluate_detection_experiment(
             include_ap30=True,
             include_mar=True,
             progress_label=f"detection {ckpt_tag}",
+            n_jobs=bootstrap_jobs,
         )
 
         record = {
@@ -1006,6 +1030,7 @@ def evaluate_segmentation_experiment(
     python_executable=None,
     bootstrap_resamples=1000,
     bootstrap_seed=42,
+    bootstrap_jobs=1,
 ):
     experiment_dir = Path(experiment_dir)
     config_path = Path(config_path) if config_path else _infer_mask_config(experiment_dir)
@@ -1054,6 +1079,7 @@ def evaluate_segmentation_experiment(
             include_ap30=False,
             include_mar=False,
             progress_label=f"segmentation {ckpt_tag}",
+            n_jobs=bootstrap_jobs,
         )
 
         aji_dice_values = compute_aji_dice_image_values_from_coco_dict(gt_dataset, pred_segm)
@@ -1129,6 +1155,7 @@ def parse_args():
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument("--bootstrap-resamples", type=int, default=1000)
     parser.add_argument("--bootstrap-seed", type=int, default=42)
+    parser.add_argument("--bootstrap-jobs", type=int, default=1)
     parser.add_argument(
         "--python-executable",
         default=None,
@@ -1166,6 +1193,7 @@ def main():
             python_executable=args.python_executable,
             bootstrap_resamples=args.bootstrap_resamples,
             bootstrap_seed=args.bootstrap_seed,
+            bootstrap_jobs=args.bootstrap_jobs,
         )
     else:
         summary_file = evaluate_segmentation_experiment(
@@ -1180,6 +1208,7 @@ def main():
             python_executable=args.python_executable,
             bootstrap_resamples=args.bootstrap_resamples,
             bootstrap_seed=args.bootstrap_seed,
+            bootstrap_jobs=args.bootstrap_jobs,
         )
     print(str(summary_file))
 

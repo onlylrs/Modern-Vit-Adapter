@@ -10,3 +10,6 @@ detection/configs/maskdino/*
 !detection/configs/maskdino/maskdino_r50_8x2_50e_coco_instance.py
 !detection/configs/maskdino/maskdino_r50_50e_coco_panoptic.py
 !detection/configs/maskdino/maskdino_vit_adapter_base_50e_coco_instance.py
+.sisyphus/
+.omo/
+docs/

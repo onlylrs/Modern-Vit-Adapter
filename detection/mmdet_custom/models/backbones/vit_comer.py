@@ -22,6 +22,7 @@ class ViTCoMer(TIMMVisionTransformer):
                  deform_ratio=1.0, add_vit_feature=True, use_extra_CTI=True,
                  use_CTI_toV=True, use_CTI_toC=True, cnn_feature_interaction=False,
                  dim_ratio=0.5, extra_num=4, *args, **kwargs):
+        with_cp = kwargs.get('with_cp', False)
         super().__init__(num_heads=num_heads, *args, **kwargs)
 
         self.cls_token = None
@@ -44,9 +45,10 @@ class ViTCoMer(TIMMVisionTransformer):
                      use_CTI_toC=use_CTI_toC if isinstance(use_CTI_toC, bool) else use_CTI_toC[i],
                      dim_ratio=dim_ratio,
                      cnn_feature_interaction=cnn_feature_interaction
-                     if isinstance(cnn_feature_interaction, bool) else cnn_feature_interaction[i],
-                     extra_CTI=((i == len(interaction_indexes) - 1) and use_extra_CTI),
-                     extra_num=extra_num)
+                      if isinstance(cnn_feature_interaction, bool) else cnn_feature_interaction[i],
+                      extra_CTI=((i == len(interaction_indexes) - 1) and use_extra_CTI),
+                      with_cp=with_cp,
+                      extra_num=extra_num)
             for i in range(len(interaction_indexes))
         ])
 

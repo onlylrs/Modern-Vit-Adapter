@@ -11,7 +11,9 @@ from mmdet.models.builder import BACKBONES
 from ops.modules import MSDeformAttn
 from timm.layers import trunc_normal_
 from torch.nn.init import normal_
+from transformers import DINOv3ViTConfig, DINOv3ViTModel
 
+from mmcv_custom.vit_checkpoint_converter import load_vit_checkpoint
 from integrations.dinov3_hf_backbone import (
     OfficialDINOv3Backbone,
     normalize_interaction_indexes,
@@ -115,7 +117,10 @@ class ViTCoMerDINOv3(nn.Module):
             raise ValueError("pretrained must point to a DINOv3 checkpoint root")
 
         resolved_root = self._resolve_checkpoint_root(pretrained)
-        self.backbone = OfficialDINOv3Backbone.from_checkpoint(resolved_root)
+        self.backbone = self._load_official_backbone(
+            resolved_root,
+            checkpoint_format=kwargs.get("checkpoint_format", "auto"),
+        )
         self._freeze_unused_dinov3_params()
         self.freeze_backbone = bool(freeze_backbone)
         if self.freeze_backbone:
@@ -216,6 +221,66 @@ class ViTCoMerDINOv3(nn.Module):
             if candidate.exists():
                 return candidate
         return root
+
+    @classmethod
+    def _load_official_backbone(cls, checkpoint_root, checkpoint_format="auto"):
+        root = Path(checkpoint_root)
+        if root.is_dir():
+            return OfficialDINOv3Backbone.from_checkpoint(root)
+        if not root.is_file():
+            raise FileNotFoundError(f"DINOv3 checkpoint not found: {root}")
+
+        config = cls._build_vitl_config(root)
+        model = DINOv3ViTModel(config)
+        state_dict = load_vit_checkpoint(
+            str(root),
+            map_location="cpu",
+            checkpoint_format=checkpoint_format,
+            target_format="hf",
+        )
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        missing = [key for key in incompatible.missing_keys if key != "pooler.dense.weight" and key != "pooler.dense.bias"]
+        if missing:
+            _logger.warning("Missing DINOv3 keys when loading %s: %s", root, missing[:20])
+        if incompatible.unexpected_keys:
+            _logger.warning("Unexpected DINOv3 keys when loading %s: %s", root, incompatible.unexpected_keys[:20])
+        model.eval()
+        return OfficialDINOv3Backbone(model=model, checkpoint_root=root)
+
+    @staticmethod
+    def _build_vitl_config(checkpoint_path):
+        state_dict = torch.load(str(checkpoint_path), map_location="cpu")
+        if isinstance(state_dict, dict) and "teacher" in state_dict and isinstance(state_dict["teacher"], dict):
+            state_dict = state_dict["teacher"]
+
+        def tensor_shape(key):
+            tensor = state_dict.get(key)
+            if tensor is None:
+                tensor = state_dict.get(f"backbone.{key}")
+            if tensor is None:
+                raise KeyError(f"Missing required DINOv3 key in {checkpoint_path}: {key}")
+            return tuple(tensor.shape)
+
+        embed_dim = tensor_shape("cls_token")[-1]
+        patch_size = tensor_shape("patch_embed.proj.weight")[-1]
+        depth = sum(1 for key in state_dict if key.startswith("blocks.") and key.endswith("norm1.weight"))
+        if depth == 0:
+            depth = sum(1 for key in state_dict if key.startswith("backbone.blocks.") and key.endswith("norm1.weight"))
+        qkv_rows = tensor_shape("blocks.0.attn.qkv.weight")[0]
+        num_heads = 16 if embed_dim == 1024 else max(1, embed_dim // 64)
+        if qkv_rows % (3 * num_heads) != 0:
+            raise ValueError(f"Cannot infer DINOv3 head count from {checkpoint_path}")
+        num_register_tokens = tensor_shape("storage_tokens")[1]
+        return DINOv3ViTConfig(
+            hidden_size=embed_dim,
+            num_hidden_layers=depth,
+            num_attention_heads=num_heads,
+            intermediate_size=embed_dim * 4,
+            patch_size=patch_size,
+            image_size=224,
+            num_register_tokens=num_register_tokens,
+            layerscale_value=1.0,
+        )
 
     def _freeze_unused_dinov3_params(self):
         # ViT-CoMer consumes prepared prefix+patch tokens directly and never uses the

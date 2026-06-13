@@ -101,3 +101,30 @@ def test_detection_coco_bootstrap_separates_ap30_and_ap50_intervals():
         np.isclose(ap30_ci["lower"], ap50_ci["lower"]) and np.isclose(ap30_ci["upper"], ap50_ci["upper"])
     )
     assert results["AP30"]["point_estimate"] >= results["AP50"]["point_estimate"]
+
+
+def test_detection_coco_bootstrap_parallel_matches_serial():
+    gt, preds = _toy_coco_detection_dataset()
+
+    serial = bootstrap_ci_from_coco_predictions(
+        gt_dataset=gt,
+        predictions=preds,
+        iou_type="bbox",
+        n_resamples=40,
+        seed=17,
+        include_ap30=True,
+        include_mar=True,
+        n_jobs=1,
+    )
+    parallel = bootstrap_ci_from_coco_predictions(
+        gt_dataset=gt,
+        predictions=preds,
+        iou_type="bbox",
+        n_resamples=40,
+        seed=17,
+        include_ap30=True,
+        include_mar=True,
+        n_jobs=2,
+    )
+
+    assert parallel == serial

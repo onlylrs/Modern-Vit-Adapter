@@ -228,6 +228,7 @@ class ViTAdapterDINOv3(nn.Module):
         pretrained=None,
         freeze_backbone=True,
         adapter_mode="official_adapter",
+        checkpoint_format="auto",
         with_cp=True,
         **kwargs,
     ):
@@ -236,7 +237,7 @@ class ViTAdapterDINOv3(nn.Module):
             raise ValueError("pretrained must point to a DINOv3 checkpoint root")
 
         resolved_root = self._resolve_checkpoint_root(pretrained)
-        self.backbone = OfficialDINOv3Backbone.from_checkpoint(resolved_root)
+        self.backbone = OfficialDINOv3Backbone.from_checkpoint(resolved_root, checkpoint_format=checkpoint_format)
         self.freeze_backbone = bool(freeze_backbone)
         if self.freeze_backbone:
             self.backbone.requires_grad_(False)

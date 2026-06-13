@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--low-mem", action="store_true", help="Enable low-memory runtime options")
     parser.add_argument("--samples-per-gpu", type=int, default=1)
     parser.add_argument("--workers-per-gpu", type=int, default=1)
+    parser.add_argument("--bootstrap-jobs", type=int, default=1)
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument("--python-executable", default=None)
     parser.add_argument(
@@ -43,6 +44,7 @@ def run_single(
     workers_per_gpu,
     cuda_visible_devices,
     python_executable,
+    bootstrap_jobs,
 ):
     command = [
         sys.executable,
@@ -64,6 +66,7 @@ def run_single(
         command.extend(["--cuda-visible-devices", str(cuda_visible_devices)])
     if python_executable is not None:
         command.extend(["--python-executable", str(python_executable)])
+    command.extend(["--bootstrap-jobs", str(int(bootstrap_jobs))])
     for option in extra_eval_option:
         command.extend(["--extra-eval-option", option])
 
@@ -85,6 +88,7 @@ def main():
             workers_per_gpu=args.workers_per_gpu,
             cuda_visible_devices=args.cuda_visible_devices,
             python_executable=args.python_executable,
+            bootstrap_jobs=args.bootstrap_jobs,
         )
 
     if args.task in ("segmentation", "both"):
@@ -99,6 +103,7 @@ def main():
             workers_per_gpu=args.workers_per_gpu,
             cuda_visible_devices=args.cuda_visible_devices,
             python_executable=args.python_executable,
+            bootstrap_jobs=args.bootstrap_jobs,
         )
 
 

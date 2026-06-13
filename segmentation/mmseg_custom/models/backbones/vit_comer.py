@@ -45,9 +45,10 @@ class ViTCoMer(TIMMVisionTransformer):
                      use_CTI_toC=use_CTI_toC if isinstance(use_CTI_toC, bool) else use_CTI_toC[i],
                      dim_ratio=dim_ratio,
                      cnn_feature_interaction=cnn_feature_interaction
-                     if isinstance(cnn_feature_interaction, bool) else cnn_feature_interaction[i],
-                     extra_CTI=((i == len(interaction_indexes) - 1) and use_extra_CTI),
-                     extra_num=extra_num)
+                      if isinstance(cnn_feature_interaction, bool) else cnn_feature_interaction[i],
+                      extra_CTI=((i == len(interaction_indexes) - 1) and use_extra_CTI),
+                      with_cp=with_cp,
+                      extra_num=extra_num)
             for i in range(len(interaction_indexes))
         ])
         self.up = nn.ConvTranspose2d(embed_dim, embed_dim, 2, 2)

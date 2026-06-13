@@ -24,6 +24,7 @@ Hacked together by / Copyright 2021 Ross Wightman
 """
 import logging
 import math
+import os
 from functools import partial
 
 import torch
@@ -32,6 +33,8 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 from mmcv.runner import BaseModule
 from mmcv_custom import my_load_checkpoint as load_checkpoint
+from mmcv_custom.my_checkpoint import load_state_dict
+from mmcv_custom.vit_checkpoint_converter import load_vit_checkpoint
 from mmdet.utils import get_root_logger
 from timm.layers import DropPath, Mlp, to_2tuple
 
@@ -363,7 +366,8 @@ class TIMMVisionTransformer(BaseModule):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, residual_indices=[], embed_dim=768,
                  depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., layer_scale=True, embed_layer=PatchEmbed, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                 act_layer=nn.GELU, window_attn=False, window_size=14, with_cp=False, pretrained=None):
+                 act_layer=nn.GELU, window_attn=False, window_size=14, with_cp=False, pretrained=None,
+                 checkpoint_format='auto'):
         """
         Args:
             img_size (int, tuple): input image size
@@ -394,6 +398,7 @@ class TIMMVisionTransformer(BaseModule):
         self.pretrain_size = img_size
         self.drop_path_rate = drop_path_rate
         self.drop_rate = drop_rate
+        self.checkpoint_format = checkpoint_format
 
         window_attn = [window_attn] * depth if not isinstance(window_attn, list) else window_attn
         window_size = [window_size] * depth if not isinstance(window_size, list) else window_size
@@ -426,6 +431,15 @@ class TIMMVisionTransformer(BaseModule):
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
             logger = get_root_logger()
+            if os.path.isdir(pretrained) or self.checkpoint_format != 'auto':
+                state_dict = load_vit_checkpoint(
+                    pretrained,
+                    map_location='cpu',
+                    checkpoint_format=self.checkpoint_format,
+                    target_state=self.state_dict(),
+                )
+                load_state_dict(self, state_dict, strict=False, logger=logger)
+                return
             load_checkpoint(self, pretrained, map_location='cpu', strict=False, logger=logger)
 
     def forward_features(self, x):

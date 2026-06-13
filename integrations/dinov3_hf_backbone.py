@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 from typing import Sequence
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoModel, DINOv3ViTConfig, DINOv3ViTModel
 
 
 class OfficialDINOv3Backbone(nn.Module):
@@ -20,9 +21,14 @@ class OfficialDINOv3Backbone(nn.Module):
         self.n_storage_tokens = int(getattr(self.model.config, "num_register_tokens", 0))
 
     @classmethod
-    def from_checkpoint(cls, checkpoint_root: Path | str) -> "OfficialDINOv3Backbone":
+    def from_checkpoint(cls, checkpoint_root: Path | str, checkpoint_format: str = "auto") -> "OfficialDINOv3Backbone":
         root = Path(checkpoint_root)
-        model = AutoModel.from_pretrained(str(root), local_files_only=True, trust_remote_code=False)
+        if root.is_dir():
+            model = AutoModel.from_pretrained(str(root), local_files_only=True, trust_remote_code=False)
+        elif root.is_file():
+            model = _load_raw_dinov3_model(root, checkpoint_format=checkpoint_format)
+        else:
+            raise FileNotFoundError(f"DINOv3 checkpoint not found: {root}")
         model.eval()
         return cls(model=model, checkpoint_root=root)
 
@@ -139,3 +145,94 @@ def normalize_interaction_ranges(interaction_indexes):
         ranges.append((start, end))
         next_start = end + 1
     return ranges
+
+
+def _load_raw_dinov3_model(checkpoint_path: Path, checkpoint_format: str = "auto") -> nn.Module:
+    config = _build_config_from_raw_checkpoint(checkpoint_path)
+    model = DINOv3ViTModel(config)
+    state_dict = _load_vit_checkpoint(
+        str(checkpoint_path),
+        map_location="cpu",
+        checkpoint_format=checkpoint_format,
+        target_format="hf",
+    )
+    state_dict = _align_hf_state_dict_prefixes(state_dict, model.state_dict())
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = [
+        key for key in incompatible.missing_keys
+        if key not in {"pooler.dense.weight", "pooler.dense.bias"}
+    ]
+    if missing:
+        raise RuntimeError(f"Missing DINOv3 keys when loading {checkpoint_path}: {missing[:20]}")
+    if incompatible.unexpected_keys:
+        raise RuntimeError(f"Unexpected DINOv3 keys when loading {checkpoint_path}: {incompatible.unexpected_keys[:20]}")
+    return model
+
+
+def _load_vit_checkpoint(*args, **kwargs):
+    converter_path = Path(__file__).resolve().parents[1] / "detection" / "mmcv_custom" / "vit_checkpoint_converter.py"
+    spec = importlib.util.spec_from_file_location("_modern_vit_checkpoint_converter", converter_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load DINOv3 checkpoint converter from {converter_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_vit_checkpoint(*args, **kwargs)
+
+
+def _align_hf_state_dict_prefixes(state_dict, target_state):
+    if any(key.startswith("model.layer.") for key in target_state):
+        state_dict = {
+            (f"model.{key}" if key.startswith("layer.") else key): value
+            for key, value in state_dict.items()
+        }
+    if "model.norm.weight" in target_state and "norm.weight" in state_dict:
+        state_dict["model.norm.weight"] = state_dict.pop("norm.weight")
+    if "model.norm.bias" in target_state and "norm.bias" in state_dict:
+        state_dict["model.norm.bias"] = state_dict.pop("norm.bias")
+    return state_dict
+
+
+def _build_config_from_raw_checkpoint(checkpoint_path: Path) -> DINOv3ViTConfig:
+    state_dict = torch.load(str(checkpoint_path), map_location="cpu")
+    if isinstance(state_dict, dict) and "teacher" in state_dict and isinstance(state_dict["teacher"], dict):
+        state_dict = state_dict["teacher"]
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"DINOv3 checkpoint must contain a state dict: {checkpoint_path}")
+
+    def tensor_shape(key: str):
+        for candidate in (key, f"backbone.{key}", f"module.{key}", f"model.{key}"):
+            tensor = state_dict.get(candidate)
+            if tensor is not None:
+                return tuple(tensor.shape)
+        raise KeyError(f"Missing required DINOv3 key in {checkpoint_path}: {key}")
+
+    def has_block_norm_key(key: str) -> bool:
+        return key.startswith("blocks.") and key.endswith("norm1.weight")
+
+    def has_backbone_block_norm_key(key: str) -> bool:
+        return key.startswith("backbone.blocks.") and key.endswith("norm1.weight")
+
+    embed_dim = tensor_shape("cls_token")[-1]
+    patch_size = tensor_shape("patch_embed.proj.weight")[-1]
+    depth = sum(1 for key in state_dict if has_block_norm_key(key))
+    if depth == 0:
+        depth = sum(1 for key in state_dict if has_backbone_block_norm_key(key))
+    if depth == 0:
+        raise ValueError(f"Cannot infer DINOv3 depth from {checkpoint_path}")
+
+    qkv_rows = tensor_shape("blocks.0.attn.qkv.weight")[0]
+    num_heads = 16 if embed_dim == 1024 else max(1, embed_dim // 64)
+    if qkv_rows % (3 * num_heads) != 0:
+        raise ValueError(f"Cannot infer DINOv3 head count from {checkpoint_path}")
+
+    num_register_tokens = tensor_shape("storage_tokens")[1]
+    return DINOv3ViTConfig(
+        hidden_size=embed_dim,
+        num_hidden_layers=depth,
+        num_attention_heads=num_heads,
+        intermediate_size=embed_dim * 4,
+        patch_size=patch_size,
+        image_size=224,
+        num_register_tokens=num_register_tokens,
+        layerscale_value=1.0,
+    )
