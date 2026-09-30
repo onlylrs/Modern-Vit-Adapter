@@ -285,16 +285,18 @@ def run_data_copy(command):
         raise MountUnavailable(f'data rsync exited {process.returncode}; see data.log')
 
 
-def retry_data_copy(command, attempts=5):
+def retry_data_copy(command, attempts=20):
     for attempt in range(attempts):
         try:
             run_data_copy(command)
             return
-        except MountUnavailable:
+        except MountUnavailable as exc:
+            if 'stopped responding' in str(exc):
+                raise
             if attempt + 1 == attempts:
                 raise
             print(f'data copy interrupted; retry {attempt + 2}/{attempts}', flush=True)
-            time.sleep(5 * (attempt + 1))
+            time.sleep(min(30, 5 * (attempt + 1)))
 
 
 def stage_data(job):
@@ -716,7 +718,8 @@ def main_controller(rows):
         for job in JOBS:
             if rows[job.key]['status'] in ('running', 'stopped', 'paused_mount', 'failed',
                                             'waiting_sync', 'blocked_dependency'):
-                update(rows, job, status='queued', gpu='', pid='')
+                update(rows, job, status='queued', phase=stage(job), gpu='', pid='',
+                       message='')
         last_health = 0.0
         health_failures = 0
         last_print = 0.0
