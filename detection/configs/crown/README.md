@@ -56,6 +56,13 @@ This avoids memory-mapped reads from sshfs during GPU startup. An interrupted
 copy resumes on the next `start`. Archived configs point back to the NAS
 source, and the staged copy is removed after all tasks complete.
 
+Each job first copies its COCO JSON files and only the referenced images to
+`/homes/rliuar/work/2_Temp/crown_runs/data/<task>`. The copy uses rsync and
+continues from partial files on the next `start`. Training and test then read
+the local copy, avoiding intermittent sshfs image read errors. One data copy
+runs at a time. The local data copy is removed after that job has been
+archived successfully.
+
 The progress files are `work_dirs/crown_pipeline/status.csv` and
 `work_dirs/crown_pipeline/results.csv`. The latter contains one row per metric
 with its mean and 95% bootstrap interval. Each task's logs and checkpoint

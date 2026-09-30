@@ -9,6 +9,7 @@ import errno
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +31,7 @@ REMOTE_CKPT = Path(os.environ.get(
     '/homes/rliuar/work/mnt/nas6/Cytology/Private/temp/X_Ckpts/crown_ckpts/CROWN.pth'))
 MOUNTPOINT = Path(os.environ.get('CROWN_MOUNTPOINT', '/homes/rliuar/work/mnt/nas6'))
 LOCAL_CKPT = LOCAL / 'pretrained/CROWN.pth'
+LOCAL_CKPT_VERIFIED = LOCAL_CKPT.with_suffix('.verified')
 STATE = Path(os.environ.get('CROWN_STATE_ROOT', REPO / 'work_dirs/crown_pipeline'))
 GPUS = (4, 5, 6, 7)
 FIELDS = ('task', 'dataset', 'train_images', 'status', 'phase', 'gpu', 'pid',
@@ -60,6 +62,18 @@ class Job:
     @property
     def config(self):
         return STATE / 'configs' / f'{self.key}.py'
+
+    @property
+    def source_config(self):
+        return STATE / 'configs' / f'{self.key}.source.py'
+
+    @property
+    def data(self):
+        return LOCAL / 'data' / self.key
+
+    @property
+    def data_marker(self):
+        return self.data / 'stage.done'
 
     @property
     def archive(self):
@@ -118,18 +132,21 @@ def detect_mount_layout():
     if any(name in os.environ for name in (
             'CROWN_PUBLIC_ROOT', 'CROWN_ARCHIVE_ROOT', 'CROWN_PRETRAINED_CKPT')):
         return
-    for base in (MOUNTPOINT / 'Cytology', MOUNTPOINT):
-        try:
-            result = timed_run(
-                ['test', '-d', str(base / 'Public')], 5,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if result.returncode == 0:
-            PUBLIC = base / 'Public'
-            REMOTE_CKPT = base / 'Private/temp/X_Ckpts/crown_ckpts/CROWN.pth'
-            ARCHIVE = base / 'Cytology/smartcyto_baseline/crown'
-            return
+    for attempt in range(3):
+        for base in (MOUNTPOINT / 'Cytology', MOUNTPOINT):
+            try:
+                result = timed_run(
+                    ['test', '-d', str(base / 'Public')], 5,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                PUBLIC = base / 'Public'
+                REMOTE_CKPT = base / 'Private/temp/X_Ckpts/crown_ckpts/CROWN.pth'
+                ARCHIVE = base / 'Cytology/smartcyto_baseline/crown'
+                return
+        if attempt < 2:
+            time.sleep(2)
 
 
 def mount_healthy():
@@ -252,6 +269,85 @@ def discover_bounded(job):
     return splits, tuple(payload['classes'])
 
 
+def run_data_copy(command):
+    process = subprocess.Popen(command, stderr=subprocess.STDOUT)
+    failed_checks = 0
+    last_check = 0.0
+    while process.poll() is None:
+        if time.monotonic() - last_check >= 15:
+            failed_checks = 0 if mount_healthy() else failed_checks + 1
+            last_check = time.monotonic()
+            if failed_checks >= 3:
+                process.terminate()
+                raise MountUnavailable('sshfs stopped responding during data staging')
+        time.sleep(2)
+    if process.returncode:
+        raise MountUnavailable(f'data rsync exited {process.returncode}; see data.log')
+
+
+def retry_data_copy(command, attempts=5):
+    for attempt in range(attempts):
+        try:
+            run_data_copy(command)
+            return
+        except MountUnavailable:
+            if attempt + 1 == attempts:
+                raise
+            print(f'data copy interrupted; retry {attempt + 2}/{attempts}', flush=True)
+            time.sleep(5 * (attempt + 1))
+
+
+def stage_data(job):
+    """Copy only COCO annotations and referenced images before GPU work."""
+    from mmcv import Config
+
+    if job.data_marker.exists():
+        return
+    if not job.source_config.exists():
+        shutil.copy2(job.config, job.source_config)
+    source_text = job.source_config.read_text(encoding='utf-8')
+    if str(PUBLIC) not in source_text:
+        for old_root in (MOUNTPOINT / 'Cytology/Public', MOUNTPOINT / 'Public'):
+            if str(old_root) in source_text:
+                source_text = source_text.replace(str(old_root), str(PUBLIC))
+                job.source_config.write_text(source_text, encoding='utf-8')
+                break
+    source = Config.fromfile(str(job.source_config))
+    local_public = job.data / 'Public'
+    for split in ('train', 'val', 'test'):
+        remote_ann = Path(source.data[split].ann_file)
+        remote_prefix = Path(source.data[split].img_prefix)
+        local_ann = local_public / remote_ann.relative_to(PUBLIC)
+        local_prefix = local_public / remote_prefix.relative_to(PUBLIC)
+        local_ann.parent.mkdir(parents=True, exist_ok=True)
+        local_prefix.mkdir(parents=True, exist_ok=True)
+        retry_data_copy(['rsync', '-t', '--partial', '--append-verify',
+                         str(remote_ann), str(local_ann)])
+        with local_ann.open(encoding='utf-8') as handle:
+            annotation = json.load(handle)
+        names = set()
+        for image in annotation['images']:
+            name = image['file_name']
+            path = Path(name)
+            if path.is_absolute() or '..' in path.parts:
+                raise ValueError(f'{remote_ann}: unsafe image path {name!r}')
+            names.add(name)
+        manifest = job.data / f'{split}.files'
+        manifest.write_bytes(b''.join(name.encode() + b'\0' for name in sorted(names)))
+        retry_data_copy(['rsync', '-rt', '--partial', '--append-verify',
+                         '--from0', f'--files-from={manifest}',
+                         str(remote_prefix) + '/', str(local_prefix) + '/'])
+        missing = next((name for name in names if not (local_prefix / name).is_file()), None)
+        if missing is not None:
+            raise MountUnavailable(f'{job.dataset}: staged image missing: {missing}')
+        print(f'{job.key}: staged {split} ({len(names)} images)', flush=True)
+    local_text = source_text.replace(str(PUBLIC), str(local_public))
+    temporary = job.config.with_suffix('.py.tmp')
+    temporary.write_text(local_text, encoding='utf-8')
+    temporary.replace(job.config)
+    job.data_marker.write_text(now(), encoding='utf-8')
+
+
 def render_config(job, splits, classes):
     base = REPO / 'detection/configs' / (
         'faster_rcnn/faster_rcnn_crown_adapter_large_fpn_1x_coco.py'
@@ -291,7 +387,12 @@ def prepare(rows):
                                  pid='', best_ckpt='', metrics_json='', message='',
                                  updated_at=now())
             save_rows(rows)
-    if not mount_healthy():
+    for attempt in range(3):
+        if mount_healthy():
+            break
+        if attempt < 2:
+            time.sleep(2)
+    else:
         raise MountUnavailable('sshfs mount unavailable; remount it and rerun start')
     (STATE / 'configs').mkdir(parents=True, exist_ok=True)
     for job in JOBS:
@@ -299,6 +400,13 @@ def prepare(rows):
             continue
         if job.config.exists() and rows[job.key]['train_images']:
             config_text = job.config.read_text(encoding='utf-8')
+            if str(job.data / 'Public') in config_text:
+                if job.data_marker.exists():
+                    continue
+                if not job.source_config.exists():
+                    raise ValueError(f'{job.dataset}: local config exists without staged data')
+                config_text = job.source_config.read_text(encoding='utf-8')
+                job.config.write_text(config_text, encoding='utf-8')
             if str(PUBLIC) not in config_text:
                 for old_root in (MOUNTPOINT / 'Cytology/Public', MOUNTPOINT / 'Public'):
                     if str(old_root) in config_text:
@@ -375,11 +483,25 @@ def _process_matches(pid, fragments):
         return False
 
 
+def log_reports_mount_error(path, start=0):
+    try:
+        with path.open('rb') as handle:
+            handle.seek(max(start, path.stat().st_size - 131072))
+            output = handle.read()
+    except OSError:
+        return False
+    return (b'Input/output error' in output or
+            b'Transport endpoint is not connected' in output or
+            b'sshfs stopped responding' in output or
+            b'data rsync exited' in output)
+
+
 def stop():
     rows = load_rows()
     for row in rows.values():
         pid = int(row.get('pid') or 0)
-        if pid and _process_matches(pid, ('detection/train.py', 'eval_automation.py', 'rsync')):
+        if pid and _process_matches(pid, ('detection/train.py', 'eval_automation.py',
+                                          '--internal-stage', 'rsync')):
             try:
                 os.killpg(pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -424,7 +546,14 @@ def command_for(job, phase, gpu):
                                   str(REPO / 'third_party/openmmlab/mmdet'),
                                   str(REPO / 'third_party/openmmlab/mmseg'),
                                   env.get('PYTHONPATH', '')))
-    if phase == 'train':
+    if phase == 'data':
+        env.update(CROWN_PUBLIC_ROOT=str(PUBLIC), CROWN_ARCHIVE_ROOT=str(ARCHIVE),
+                   CROWN_PRETRAINED_CKPT=str(REMOTE_CKPT), CROWN_LOCAL_ROOT=str(LOCAL),
+                   CROWN_STATE_ROOT=str(STATE), CROWN_MOUNTPOINT=str(MOUNTPOINT))
+        cmd = [sys.executable, str(Path(__file__).resolve()),
+               '--internal-stage', job.key]
+        cwd = REPO
+    elif phase == 'train':
         cmd = [sys.executable, str(REPO / 'detection/train.py'), str(job.config),
                '--work-dir', str(job.work), '--auto-resume', '--seed', '42']
         cwd = REPO / 'detection'
@@ -458,7 +587,9 @@ def command_for(job, phase, gpu):
             raise MountUnavailable(f'cannot create NAS archive directory: {mkdir.stderr.strip()}')
         archived_config = job.work / job.config.name
         archived_config.write_text(
-            job.config.read_text(encoding='utf-8').replace(str(LOCAL_CKPT), str(REMOTE_CKPT)),
+            job.config.read_text(encoding='utf-8')
+            .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
+            .replace(str(job.data / 'Public'), str(PUBLIC)),
             encoding='utf-8')
         cmd = ['rsync', '-a', '--partial', '--exclude=*.pth' if job.external else '--include=*',
                str(job.work) + '/', str(job.archive) + '/']
@@ -467,6 +598,8 @@ def command_for(job, phase, gpu):
 
 
 def stage(job):
+    if not job.data_marker.exists():
+        return 'data'
     if not job.external and not (job.work / 'train.done').exists():
         return 'train'
     if not (job.work / 'eval.done').exists():
@@ -483,6 +616,18 @@ class StopRequested(RuntimeError):
 
 
 def stage_pretrained(interrupted):
+    if LOCAL_CKPT.is_file():
+        local_size = LOCAL_CKPT.stat().st_size
+        if (LOCAL_CKPT_VERIFIED.is_file() and
+                LOCAL_CKPT_VERIFIED.read_text().strip() == str(local_size)):
+            return
+        try:
+            with zipfile.ZipFile(LOCAL_CKPT) as archive:
+                if archive.testzip() is None:
+                    LOCAL_CKPT_VERIFIED.write_text(str(local_size), encoding='utf-8')
+                    return
+        except (OSError, zipfile.BadZipFile):
+            pass
     if not checkpoint_source_healthy():
         raise MountUnavailable('sshfs unavailable while staging CROWN weights')
     try:
@@ -532,6 +677,7 @@ def stage_pretrained(interrupted):
     if bad_member is not None:
         raise RuntimeError(f'Staged CROWN checkpoint is corrupt: {bad_member}')
     partial.replace(LOCAL_CKPT)
+    LOCAL_CKPT_VERIFIED.write_text(str(remote_size), encoding='utf-8')
 
 
 def main_controller(rows):
@@ -572,18 +718,20 @@ def main_controller(rows):
                                             'waiting_sync', 'blocked_dependency'):
                 update(rows, job, status='queued', gpu='', pid='')
         last_health = 0.0
+        health_failures = 0
         last_print = 0.0
         while True:
             if interrupted:
                 reason = 'stopped'
                 break
             if time.monotonic() - last_health >= 15:
-                if not mount_healthy():
+                health_failures = 0 if mount_healthy() else health_failures + 1
+                if health_failures >= 3:
                     reason = 'paused_mount'
                     break
                 last_health = time.monotonic()
             mount_broken = False
-            for gpu, (job, phase, process, log) in list(active.items()):
+            for gpu, (job, phase, process, log, log_start) in list(active.items()):
                 code = process.poll()
                 if code is None:
                     continue
@@ -591,15 +739,20 @@ def main_controller(rows):
                 del active[gpu]
                 update(rows, job, gpu='', pid='')
                 if code:
-                    if not mount_healthy():
+                    if log_reports_mount_error(job.work / f'{phase}.log', log_start) or not mount_healthy():
                         update(rows, job, status='paused_mount', phase=phase,
-                               message='sshfs became unavailable')
+                               message='sshfs I/O error; resume after mount is stable')
                         mount_broken = True
                         break
                     update(rows, job, status='failed', phase=phase,
                            message=f'{phase} exited {code}; see {job.work / (phase + ".log")}')
                     continue
-                if phase == 'train':
+                if phase == 'data':
+                    if not job.data_marker.exists():
+                        update(rows, job, status='failed', phase=phase,
+                               message='data staging marker missing')
+                        continue
+                elif phase == 'train':
                     try:
                         best = best_checkpoint(job)
                     except FileNotFoundError as exc:
@@ -631,20 +784,24 @@ def main_controller(rows):
                             ckpt.unlink()
                     update(rows, job, status='complete', phase='done',
                            best_ckpt=archived_best, message='archived on NAS')
+                    shutil.rmtree(job.data, ignore_errors=True)
                     continue
                 update(rows, job, status='queued', phase=stage(job))
             if mount_broken:
                 reason = 'paused_mount'
                 break
             busy = set(active)
+            data_active = any(phase == 'data' for _, phase, _, _, _ in active.values())
             candidates = sorted(
                 (job for job in JOBS if rows[job.key]['status'] == 'queued'),
                 key=lambda job: (int(rows[job.key]['train_images'] or 10**12), job.dataset))
             for gpu in GPUS:
                 if gpu in busy:
                     continue
-                eligible = next((job for job in candidates if not job.external or
-                                 rows[BY_KEY['det_txl_pbc'].key]['status'] == 'complete'), None)
+                eligible = next((job for job in candidates
+                                 if (not job.external or
+                                     rows[BY_KEY['det_txl_pbc'].key]['status'] == 'complete')
+                                 and (stage(job) != 'data' or not data_active)), None)
                 if eligible is None:
                     break
                 candidates.remove(eligible)
@@ -655,9 +812,12 @@ def main_controller(rows):
                     if eligible.external and phase == 'eval':
                         update(rows, eligible, best_ckpt=best_checkpoint(eligible))
                     log = (eligible.work / f'{phase}.log').open('a', encoding='utf-8')
+                    log_start = log.tell()
                     process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log,
                                                stderr=subprocess.STDOUT, start_new_session=True)
-                    active[gpu] = (eligible, phase, process, log)
+                    active[gpu] = (eligible, phase, process, log, log_start)
+                    if phase == 'data':
+                        data_active = True
                     update(rows, eligible, status='running', phase=phase, gpu=gpu,
                            pid=process.pid, message='')
                 except Exception as exc:
@@ -681,7 +841,7 @@ def main_controller(rows):
                 reason = 'finished'
                 break
             time.sleep(5)
-        for gpu, (job, phase, process, log) in active.items():
+        for gpu, (job, phase, process, log, _) in active.items():
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -698,6 +858,7 @@ def main_controller(rows):
                     update(rows, job, status='paused_mount', message='sshfs unavailable')
         if all(rows.get(job.key, {}).get('status') == 'complete' for job in JOBS):
             LOCAL_CKPT.unlink(missing_ok=True)
+            LOCAL_CKPT_VERIFIED.unlink(missing_ok=True)
         print(f'Controller ended: {reason}')
     finally:
         (STATE / 'controller.pid').unlink(missing_ok=True)
@@ -709,6 +870,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', nargs='?', choices=('prepare', 'start', 'stop', 'status'), default='status')
     parser.add_argument('--internal-discover', choices=BY_KEY, help=argparse.SUPPRESS)
+    parser.add_argument('--internal-stage', choices=BY_KEY, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.internal_discover:
         try:
@@ -720,6 +882,9 @@ def main():
             }))
         except Exception as exc:
             print(json.dumps({'error': str(exc), 'errno': getattr(exc, 'errno', None)}))
+        return
+    if args.internal_stage:
+        stage_data(BY_KEY[args.internal_stage])
         return
     if args.action == 'stop':
         stop()
