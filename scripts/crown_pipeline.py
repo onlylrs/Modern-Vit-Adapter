@@ -542,7 +542,7 @@ def best_checkpoint(job):
 
 def command_for(job, phase, gpu):
     env = os.environ.copy()
-    env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    env['CUDA_VISIBLE_DEVICES'] = '' if phase == 'data' else str(gpu)
     env['MPLCONFIGDIR'] = str(STATE / 'matplotlib')
     env['PYTHONPATH'] = ':'.join((str(REPO), str(REPO / 'third_party/openmmlab/mmcv'),
                                   str(REPO / 'third_party/openmmlab/mmdet'),
@@ -794,17 +794,44 @@ def main_controller(rows):
                 reason = 'paused_mount'
                 break
             busy = set(active)
-            data_active = any(phase == 'data' for _, phase, _, _, _ in active.values())
             candidates = sorted(
                 (job for job in JOBS if rows[job.key]['status'] == 'queued'),
                 key=lambda job: (int(rows[job.key]['train_images'] or 10**12), job.dataset))
+            if -1 not in active:
+                data_job = next((job for job in candidates
+                                 if stage(job) == 'data' and
+                                 (not job.external or
+                                  rows[BY_KEY['det_txl_pbc'].key]['status'] == 'complete')), None)
+                if data_job is not None:
+                    candidates.remove(data_job)
+                    data_job.work.mkdir(parents=True, exist_ok=True)
+                    try:
+                        cmd, cwd, env = command_for(data_job, 'data', None)
+                        log = (data_job.work / 'data.log').open('a', encoding='utf-8')
+                        log_start = log.tell()
+                        process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log,
+                                                   stderr=subprocess.STDOUT, start_new_session=True)
+                        active[-1] = (data_job, 'data', process, log, log_start)
+                        update(rows, data_job, status='running', phase='data', gpu='',
+                               pid=process.pid, message='')
+                    except Exception as exc:
+                        if isinstance(exc, MountUnavailable) or not mount_healthy():
+                            update(rows, data_job, status='paused_mount', phase='data',
+                                   message=str(exc)[:240])
+                            mount_broken = True
+                        else:
+                            update(rows, data_job, status='failed', phase='data',
+                                   message=str(exc)[:240])
+            if mount_broken:
+                reason = 'paused_mount'
+                break
             for gpu in GPUS:
                 if gpu in busy:
                     continue
                 eligible = next((job for job in candidates
                                  if (not job.external or
                                      rows[BY_KEY['det_txl_pbc'].key]['status'] == 'complete')
-                                 and (stage(job) != 'data' or not data_active)), None)
+                                 and stage(job) != 'data'), None)
                 if eligible is None:
                     break
                 candidates.remove(eligible)
@@ -819,8 +846,6 @@ def main_controller(rows):
                     process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log,
                                                stderr=subprocess.STDOUT, start_new_session=True)
                     active[gpu] = (eligible, phase, process, log, log_start)
-                    if phase == 'data':
-                        data_active = True
                     update(rows, eligible, status='running', phase=phase, gpu=gpu,
                            pid=process.pid, message='')
                 except Exception as exc:
