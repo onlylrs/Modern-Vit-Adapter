@@ -9,6 +9,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -370,13 +371,16 @@ def stage_archive(job):
         .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
         .replace(str(job.data / 'Public'), str(PUBLIC)),
         encoding='utf-8')
-    checkpoint_filters = (['--exclude=*.pth'] if job.external else
-                          ['--include=best_*.pth', '--exclude=*.pth'])
     retry_resumable_copy([
         'rsync', '-a', '--no-owner', '--no-group', '--no-perms', '--omit-dir-times',
-        '--partial', '--append-verify', '--exclude=sync.log',
-        *checkpoint_filters,
+        '--partial', '--append-verify', '--delete-excluded',
+        '--exclude=sync.log', '--exclude=*.pth',
         str(job.work) + '/', str(job.archive) + '/'])
+    if not job.external:
+        selected = best_checkpoint(job)
+        retry_resumable_copy([
+            'rsync', '--partial', '--append-verify',
+            str(selected), str(job.archive / selected.name)])
 
 
 def render_config(job, splits, classes):
@@ -547,26 +551,34 @@ def stop():
 
 
 def best_checkpoint(job):
+    def newest_best(paths):
+        paths = list(paths)
+        if not paths:
+            return None
+        return max(paths, key=lambda path: (
+            int(match.group(1)) if (match := re.search(r'epoch_(\d+)', path.name)) else -1,
+            path.name))
+
     if job.external:
         # Retain the source checkpoint locally until CBC's external test ends.
         parent = BY_KEY['det_txl_pbc']
-        local_best = sorted(parent.work.glob('best_*.pth'))
+        local_best = newest_best(parent.work.glob('best_*.pth'))
         if local_best:
-            return local_best[-1]
+            return local_best
         recorded = load_rows().get('det_txl_pbc', {}).get('best_ckpt')
         if recorded and Path(recorded).is_file():
             return Path(recorded)
-    best = sorted(job.work.glob('best_*.pth'))
+    best = newest_best(job.work.glob('best_*.pth'))
     if best:
-        return best[-1]
-    best = sorted(job.archive.glob('best_*.pth'))
+        return best
+    best = newest_best(job.archive.glob('best_*.pth'))
     if best:
-        return best[-1]
+        return best
     if job.external:
         parent = BY_KEY['det_txl_pbc']
-        best = sorted(parent.archive.glob('best_*.pth'))
+        best = newest_best(parent.archive.glob('best_*.pth'))
         if best:
-            return best[-1]
+            return best
     raise FileNotFoundError(f'{job.dataset}: no validation-selected best checkpoint')
 
 
@@ -789,7 +801,7 @@ def main_controller(rows):
                     write_results(rows)
                 else:
                     archived_best = (rows[BY_KEY['det_txl_pbc'].key]['best_ckpt'] if job.external
-                                     else job.archive / Path(rows[job.key]['best_ckpt']).name)
+                                     else job.archive / best_checkpoint(job).name)
                     if not job.external:
                         for ckpt in job.work.glob('*.pth'):
                             if (job.key == 'det_txl_pbc' and ckpt.name.startswith('best_')
