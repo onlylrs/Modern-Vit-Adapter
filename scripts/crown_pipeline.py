@@ -279,7 +279,7 @@ def run_resumable_copy(command):
             last_check = time.monotonic()
             if failed_checks >= 3:
                 process.terminate()
-                raise MountUnavailable('sshfs stopped responding during data staging')
+                raise MountUnavailable('sshfs stopped responding during transfer')
         time.sleep(2)
     if process.returncode:
         raise MountUnavailable(f'rsync exited {process.returncode}; see phase log')
@@ -370,10 +370,12 @@ def stage_archive(job):
         .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
         .replace(str(job.data / 'Public'), str(PUBLIC)),
         encoding='utf-8')
+    checkpoint_filters = (['--exclude=*.pth'] if job.external else
+                          ['--include=best_*.pth', '--exclude=*.pth'])
     retry_resumable_copy([
         'rsync', '-a', '--no-owner', '--no-group', '--no-perms', '--omit-dir-times',
         '--partial', '--append-verify', '--exclude=sync.log',
-        '--exclude=*.pth' if job.external else '--include=*',
+        *checkpoint_filters,
         str(job.work) + '/', str(job.archive) + '/'])
 
 
@@ -570,7 +572,7 @@ def best_checkpoint(job):
 
 def command_for(job, phase, gpu):
     env = os.environ.copy()
-    env['CUDA_VISIBLE_DEVICES'] = '' if phase == 'data' else str(gpu)
+    env['CUDA_VISIBLE_DEVICES'] = '' if phase in ('data', 'sync') else str(gpu)
     env['MPLCONFIGDIR'] = str(STATE / 'matplotlib')
     env['PYTHONPATH'] = ':'.join((str(REPO), str(REPO / 'third_party/openmmlab/mmcv'),
                                   str(REPO / 'third_party/openmmlab/mmdet'),
@@ -812,6 +814,31 @@ def main_controller(rows):
             candidates = sorted(
                 (job for job in JOBS if rows[job.key]['status'] == 'queued'),
                 key=lambda job: (int(rows[job.key]['train_images'] or 10**12), job.dataset))
+            if -2 not in active:
+                sync_job = next((job for job in candidates if stage(job) == 'sync'), None)
+                if sync_job is not None:
+                    candidates.remove(sync_job)
+                    sync_job.work.mkdir(parents=True, exist_ok=True)
+                    try:
+                        cmd, cwd, env = command_for(sync_job, 'sync', None)
+                        log = (sync_job.work / 'sync.log').open('a', encoding='utf-8')
+                        log_start = log.tell()
+                        process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log,
+                                                   stderr=subprocess.STDOUT, start_new_session=True)
+                        active[-2] = (sync_job, 'sync', process, log, log_start)
+                        update(rows, sync_job, status='running', phase='sync', gpu='',
+                               pid=process.pid, message='')
+                    except Exception as exc:
+                        if isinstance(exc, MountUnavailable) or not mount_healthy():
+                            update(rows, sync_job, status='paused_mount', phase='sync',
+                                   message=str(exc)[:240])
+                            mount_broken = True
+                        else:
+                            update(rows, sync_job, status='failed', phase='sync',
+                                   message=str(exc)[:240])
+            if mount_broken:
+                reason = 'paused_mount'
+                break
             if -1 not in active:
                 data_job = next((job for job in candidates
                                  if stage(job) == 'data' and
@@ -846,7 +873,7 @@ def main_controller(rows):
                 eligible = next((job for job in candidates
                                  if (not job.external or
                                      rows[BY_KEY['det_txl_pbc'].key]['status'] == 'complete')
-                                 and stage(job) != 'data'), None)
+                                 and stage(job) not in ('data', 'sync')), None)
                 if eligible is None:
                     break
                 candidates.remove(eligible)

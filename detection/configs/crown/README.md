@@ -62,6 +62,8 @@ continues from partial files on the next `start`. Training and test then read
 the local copy, avoiding intermittent sshfs image read errors. One data copy
 runs at a time. The local data copy is removed after that job has been
 archived successfully.
+Data copying and checkpoint archiving use separate CPU workers, leaving all
+four GPU slots available for experiments when datasets are ready.
 
 The progress files are `work_dirs/crown_pipeline/status.csv` and
 `work_dirs/crown_pipeline/results.csv`. The latter contains one row per metric
@@ -73,7 +75,9 @@ checkpoints are deleted only after `rsync` succeeds. Set `CROWN_LOCAL_ROOT`,
 those paths.
 Checkpoint archiving also retries interrupted sshfs writes with resumable
 rsync transfers. It does not request NAS owner, group, or permission changes,
-and keeps local checkpoints until the full archive succeeds.
+and keeps local checkpoints until the full archive succeeds. Only the best
+validation checkpoint is archived; intermediate epoch checkpoints are removed
+locally after that succeeds.
 The TXL-PBC best checkpoint stays in the local temporary directory until
 CBC's external test completes, so that test does not load a model across sshfs.
 
