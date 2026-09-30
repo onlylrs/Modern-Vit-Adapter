@@ -71,6 +71,8 @@ synced to the NAS `smartcyto_baseline/crown/{det,seg}` directory. Local
 checkpoints are deleted only after `rsync` succeeds. Set `CROWN_LOCAL_ROOT`,
 `CROWN_STATE_ROOT`, `CROWN_PUBLIC_ROOT`, or `CROWN_ARCHIVE_ROOT` to override
 those paths.
+Checkpoint archiving also retries interrupted sshfs writes with resumable
+rsync transfers. It keeps local checkpoints until the full archive succeeds.
 The TXL-PBC best checkpoint stays in the local temporary directory until
 CBC's external test completes, so that test does not load a model across sshfs.
 

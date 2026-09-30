@@ -269,7 +269,7 @@ def discover_bounded(job):
     return splits, tuple(payload['classes'])
 
 
-def run_data_copy(command):
+def run_resumable_copy(command):
     process = subprocess.Popen(command, stderr=subprocess.STDOUT)
     failed_checks = 0
     last_check = 0.0
@@ -282,20 +282,20 @@ def run_data_copy(command):
                 raise MountUnavailable('sshfs stopped responding during data staging')
         time.sleep(2)
     if process.returncode:
-        raise MountUnavailable(f'data rsync exited {process.returncode}; see data.log')
+        raise MountUnavailable(f'rsync exited {process.returncode}; see phase log')
 
 
-def retry_data_copy(command, attempts=20):
+def retry_resumable_copy(command, attempts=20):
     for attempt in range(attempts):
         try:
-            run_data_copy(command)
+            run_resumable_copy(command)
             return
         except MountUnavailable as exc:
             if 'stopped responding' in str(exc):
                 raise
             if attempt + 1 == attempts:
                 raise
-            print(f'data copy interrupted; retry {attempt + 2}/{attempts}', flush=True)
+            print(f'resumable copy interrupted; retry {attempt + 2}/{attempts}', flush=True)
             time.sleep(min(30, 5 * (attempt + 1)))
 
 
@@ -323,8 +323,8 @@ def stage_data(job):
         local_prefix = local_public / remote_prefix.relative_to(PUBLIC)
         local_ann.parent.mkdir(parents=True, exist_ok=True)
         local_prefix.mkdir(parents=True, exist_ok=True)
-        retry_data_copy(['rsync', '-t', '--partial', '--append-verify',
-                         str(remote_ann), str(local_ann)])
+        retry_resumable_copy(['rsync', '-t', '--partial', '--append-verify',
+                              str(remote_ann), str(local_ann)])
         with local_ann.open(encoding='utf-8') as handle:
             annotation = json.load(handle)
         names = set()
@@ -336,9 +336,9 @@ def stage_data(job):
             names.add(name)
         manifest = job.data / f'{split}.files'
         manifest.write_bytes(b''.join(name.encode() + b'\0' for name in sorted(names)))
-        retry_data_copy(['rsync', '-rt', '--partial', '--append-verify',
-                         '--from0', f'--files-from={manifest}',
-                         str(remote_prefix) + '/', str(local_prefix) + '/'])
+        retry_resumable_copy(['rsync', '-rt', '--partial', '--append-verify',
+                              '--from0', f'--files-from={manifest}',
+                              str(remote_prefix) + '/', str(local_prefix) + '/'])
         missing = next((name for name in names if not (local_prefix / name).is_file()), None)
         if missing is not None:
             raise MountUnavailable(f'{job.dataset}: staged image missing: {missing}')
@@ -348,6 +348,32 @@ def stage_data(job):
     temporary.write_text(local_text, encoding='utf-8')
     temporary.replace(job.config)
     job.data_marker.write_text(now(), encoding='utf-8')
+
+
+def stage_archive(job):
+    """Archive checkpoints and metrics with resumable sshfs writes."""
+    for attempt in range(5):
+        try:
+            mkdir = timed_run(
+                ['mkdir', '-p', str(job.archive)], 10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if mkdir.returncode == 0:
+                break
+        except subprocess.TimeoutExpired:
+            pass
+        if attempt == 4:
+            raise MountUnavailable(f'cannot create NAS archive directory: {job.archive}')
+        time.sleep(5 * (attempt + 1))
+    archived_config = job.work / job.config.name
+    archived_config.write_text(
+        job.config.read_text(encoding='utf-8')
+        .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
+        .replace(str(job.data / 'Public'), str(PUBLIC)),
+        encoding='utf-8')
+    retry_resumable_copy([
+        'rsync', '-a', '--partial', '--append-verify', '--exclude=sync.log',
+        '--exclude=*.pth' if job.external else '--include=*',
+        str(job.work) + '/', str(job.archive) + '/'])
 
 
 def render_config(job, splits, classes):
@@ -495,7 +521,8 @@ def log_reports_mount_error(path, start=0):
     return (b'Input/output error' in output or
             b'Transport endpoint is not connected' in output or
             b'sshfs stopped responding' in output or
-            b'data rsync exited' in output)
+            b'cannot create NAS archive' in output or
+            b'rsync exited' in output)
 
 
 def stop():
@@ -503,7 +530,7 @@ def stop():
     for row in rows.values():
         pid = int(row.get('pid') or 0)
         if pid and _process_matches(pid, ('detection/train.py', 'eval_automation.py',
-                                          '--internal-stage', 'rsync')):
+                                          '--internal-stage', '--internal-sync', 'rsync')):
             try:
                 os.killpg(pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -548,10 +575,11 @@ def command_for(job, phase, gpu):
                                   str(REPO / 'third_party/openmmlab/mmdet'),
                                   str(REPO / 'third_party/openmmlab/mmseg'),
                                   env.get('PYTHONPATH', '')))
-    if phase == 'data':
+    if phase in ('data', 'sync'):
         env.update(CROWN_PUBLIC_ROOT=str(PUBLIC), CROWN_ARCHIVE_ROOT=str(ARCHIVE),
                    CROWN_PRETRAINED_CKPT=str(REMOTE_CKPT), CROWN_LOCAL_ROOT=str(LOCAL),
                    CROWN_STATE_ROOT=str(STATE), CROWN_MOUNTPOINT=str(MOUNTPOINT))
+    if phase == 'data':
         cmd = [sys.executable, str(Path(__file__).resolve()),
                '--internal-stage', job.key]
         cwd = REPO
@@ -579,23 +607,8 @@ def command_for(job, phase, gpu):
                '--cuda-visible-devices', str(gpu)]
         cwd = REPO
     else:
-        try:
-            mkdir = timed_run(
-                ['mkdir', '-p', str(job.archive)], 10,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        except subprocess.TimeoutExpired as exc:
-            raise MountUnavailable('timed out creating NAS archive directory') from exc
-        if mkdir.returncode:
-            raise MountUnavailable(f'cannot create NAS archive directory: {mkdir.stderr.strip()}')
-        archived_config = job.work / job.config.name
-        archived_config.write_text(
-            job.config.read_text(encoding='utf-8')
-            .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
-            .replace(str(job.data / 'Public'), str(PUBLIC)),
-            encoding='utf-8')
-        cmd = ['rsync', '-a', '--partial', '--append-verify',
-               '--exclude=*.pth' if job.external else '--include=*',
-               str(job.work) + '/', str(job.archive) + '/']
+        cmd = [sys.executable, str(Path(__file__).resolve()),
+               '--internal-sync', job.key]
         cwd = REPO
     return cmd, cwd, env
 
@@ -900,6 +913,7 @@ def main():
     parser.add_argument('action', nargs='?', choices=('prepare', 'start', 'stop', 'status'), default='status')
     parser.add_argument('--internal-discover', choices=BY_KEY, help=argparse.SUPPRESS)
     parser.add_argument('--internal-stage', choices=BY_KEY, help=argparse.SUPPRESS)
+    parser.add_argument('--internal-sync', choices=BY_KEY, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.internal_discover:
         try:
@@ -914,6 +928,9 @@ def main():
         return
     if args.internal_stage:
         stage_data(BY_KEY[args.internal_stage])
+        return
+    if args.internal_sync:
+        stage_archive(BY_KEY[args.internal_sync])
         return
     if args.action == 'stop':
         stop()
