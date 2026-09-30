@@ -302,14 +302,9 @@ def _evaluate_coco_metric_set(gt_dataset, predictions, iou_type, include_ap30=Fa
         out["AP30"] = float(eval_ap30.stats[0])
 
     if include_mar:
-        with contextlib.redirect_stdout(io.StringIO()):
-            eval_mar = COCOeval(coco_gt, coco_dt, iouType=iou_type)
-            eval_mar.params.imgIds = sorted(coco_gt.getImgIds())
-            eval_mar.params.useCats = 0
-            eval_mar.evaluate()
-            eval_mar.accumulate()
-            eval_mar.summarize()
-        out["mAR"] = float(eval_mar.stats[8])
+        # COCO stats[8] is category-aware average recall over IoU .50:.95
+        # with at most 100 detections per image.
+        out["mAR"] = float(eval_default.stats[8])
     return out
 
 
@@ -1096,8 +1091,14 @@ def evaluate_segmentation_experiment(
         merged_metrics = {
             "mAP": coco_metrics["mAP"],
             "AP50": coco_metrics["AP50"],
-            "AJI": metric_with_bootstrap_values(aji_dice_values["aji_values"]),
-            "Dice": metric_with_bootstrap_values(aji_dice_values["dice_values"]),
+            "AJI": {
+                **metric_with_bootstrap_values(aji_dice_values["aji_values"]),
+                "ci95": ci_aji,
+            },
+            "Dice": {
+                **metric_with_bootstrap_values(aji_dice_values["dice_values"]),
+                "ci95": ci_dice,
+            },
         }
 
         record = {

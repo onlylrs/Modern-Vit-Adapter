@@ -1,5 +1,6 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 from .beit_adapter import BEiTAdapter
+from .crown_adapter import ViTAdapterCROWN
 from .dinov3_adapter import DINOv3Adapter, ViTAdapterDINOv3
 from .dinov3_comer import DINOv3CoMer, ViTCoMerDINOv3
 from .dinov3_split import DINOv3SplitFusion
@@ -14,6 +15,7 @@ __all__ = [
     'ViTAdapter',
     'ViTBaseline',
     'BEiTAdapter',
+    'ViTAdapterCROWN',
     'ViTAdapterDINOv3',
     'DINOv3Adapter',
     'ViTCoMerDINOv3',

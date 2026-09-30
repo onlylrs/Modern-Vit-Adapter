@@ -1,4 +1,6 @@
 import os.path as osp
+import json
+from pathlib import Path
 
 import torch.distributed as dist
 from mmdet.core import DistEvalHook, EvalHook
@@ -14,6 +16,7 @@ class _ReliableEvalMixin:
         self.early_stop_rule = early_stop_rule
         self._best_score = None
         self._bad_epochs = 0
+        self._restored = False
 
     def _is_improved(self, score):
         if self._best_score is None:
@@ -26,6 +29,18 @@ class _ReliableEvalMixin:
         metric_name = self.early_stop_metric or self.key_indicator
         if metric_name is None or self.early_stop_patience is None:
             return
+        hook_msgs = runner.meta.setdefault('hook_msgs', {}) if runner.meta is not None else {}
+        state_path = Path(runner.work_dir) / f'early_stop_{metric_name}.json'
+        if not self._restored:
+            self._best_score = hook_msgs.get(f'early_stop_best_{metric_name}', self._best_score)
+            self._bad_epochs = hook_msgs.get(f'early_stop_bad_epochs_{metric_name}', self._bad_epochs)
+            try:
+                state = json.loads(state_path.read_text(encoding='utf-8'))
+                self._best_score = state['best_score']
+                self._bad_epochs = state['bad_epochs']
+            except (OSError, ValueError, KeyError):
+                pass
+            self._restored = True
         metrics = runner.log_buffer.output
         if metric_name not in metrics:
             return
@@ -44,6 +59,15 @@ class _ReliableEvalMixin:
                     runner.train_loop.stop_training = True
                 else:
                     runner._max_epochs = runner.epoch + 1
+        hook_msgs[f'early_stop_best_{metric_name}'] = self._best_score
+        hook_msgs[f'early_stop_bad_epochs_{metric_name}'] = self._bad_epochs
+        temporary = state_path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps({
+            'best_score': self._best_score,
+            'bad_epochs': self._bad_epochs,
+            'epoch': runner.epoch + 1,
+        }), encoding='utf-8')
+        temporary.replace(state_path)
 
 
 class ReliableEvalHook(_ReliableEvalMixin, EvalHook):
@@ -56,7 +80,7 @@ class ReliableEvalHook(_ReliableEvalMixin, EvalHook):
         self.latest_results = results
         runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
         key_score = self.evaluate(runner, results)
-        if self.save_best and key_score:
+        if self.save_best and key_score is not None:
             self._save_ckpt(runner, key_score)
         self._update_early_stop(runner)
 
@@ -89,6 +113,6 @@ class ReliableDistEvalHook(_ReliableEvalMixin, DistEvalHook):
             self.latest_results = results
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
             key_score = self.evaluate(runner, results)
-            if self.save_best and key_score:
+            if self.save_best and key_score is not None:
                 self._save_ckpt(runner, key_score)
             self._update_early_stop(runner)
