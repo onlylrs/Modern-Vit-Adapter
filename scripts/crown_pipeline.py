@@ -593,7 +593,8 @@ def command_for(job, phase, gpu):
             .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
             .replace(str(job.data / 'Public'), str(PUBLIC)),
             encoding='utf-8')
-        cmd = ['rsync', '-a', '--partial', '--exclude=*.pth' if job.external else '--include=*',
+        cmd = ['rsync', '-a', '--partial', '--append-verify',
+               '--exclude=*.pth' if job.external else '--include=*',
                str(job.work) + '/', str(job.archive) + '/']
         cwd = REPO
     return cmd, cwd, env
