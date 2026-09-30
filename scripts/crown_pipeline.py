@@ -371,7 +371,8 @@ def stage_archive(job):
         .replace(str(job.data / 'Public'), str(PUBLIC)),
         encoding='utf-8')
     retry_resumable_copy([
-        'rsync', '-a', '--partial', '--append-verify', '--exclude=sync.log',
+        'rsync', '-a', '--no-owner', '--no-group', '--no-perms', '--omit-dir-times',
+        '--partial', '--append-verify', '--exclude=sync.log',
         '--exclude=*.pth' if job.external else '--include=*',
         str(job.work) + '/', str(job.archive) + '/'])
 
