@@ -310,14 +310,9 @@ def _evaluate_coco_metric_set(gt_dataset, predictions, iou_type, include_ap30=Fa
         out["AP30"] = float(eval_ap30.stats[0])
 
     if include_mar:
-        with contextlib.redirect_stdout(io.StringIO()):
-            eval_mar = COCOeval(coco_gt, coco_dt, iouType=iou_type)
-            eval_mar.params.imgIds = sorted(coco_gt.getImgIds())
-            eval_mar.params.useCats = 0
-            eval_mar.evaluate()
-            eval_mar.accumulate()
-            eval_mar.summarize()
-        out["mAR"] = float(eval_mar.stats[8])
+        # COCO stats[8] is category-aware average recall over IoU .50:.95
+        # with at most 100 detections per image.
+        out["mAR"] = float(eval_default.stats[8])
     return out
 
 
@@ -377,18 +372,14 @@ def _evaluate_coco_bootstrap_sample(args):
     )
 
 
-def _build_coco_match_cache(gt_dataset, predictions, iou_type, include_ap30, include_mar=True):
+def _build_coco_match_cache(gt_dataset, predictions, iou_type, include_ap30):
     """Compute image-local matching once; bootstrap only repeats accumulation."""
     coco_gt = _build_coco_api_from_dataset_dict(gt_dataset)
     coco_dt = _load_coco_results(coco_gt, predictions)
     caches = []
-    modes = ['default'] + (['ap30'] if include_ap30 else []) + (['mar'] if include_mar else [])
-    for mode in modes:
+    for ap30 in ([False, True] if include_ap30 else [False]):
         evaluator = COCOeval(coco_gt, coco_dt, iouType=iou_type)
-        if mode == 'mar':
-            # Preserve main's category-agnostic proposal recall definition.
-            evaluator.params.useCats = 0
-        if mode == 'ap30':
+        if ap30:
             evaluator.params.iouThrs = np.array([0.3], dtype=np.float64)
         with contextlib.redirect_stdout(io.StringIO()):
             evaluator.evaluate()
@@ -415,11 +406,10 @@ def _accumulate_cached_sample(caches, sampled_ids, include_mar):
         with contextlib.redirect_stdout(io.StringIO()):
             evaluator.accumulate()
             evaluator.summarize()
-        if not params.useCats:
+        if cache_idx == 0:
+            metrics.update(mAP=float(evaluator.stats[0]), AP50=float(evaluator.stats[1]))
             if include_mar:
                 metrics['mAR'] = float(evaluator.stats[8])
-        elif cache_idx == 0:
-            metrics.update(mAP=float(evaluator.stats[0]), AP50=float(evaluator.stats[1]))
         else:
             metrics['AP30'] = float(evaluator.stats[0])
     return metrics
@@ -463,7 +453,7 @@ def bootstrap_ci_from_coco_predictions(
         raise ValueError("n_resamples must be > 0")
 
     started = time.perf_counter()
-    caches = _build_coco_match_cache(gt_dataset, predictions, iou_type, include_ap30, include_mar)
+    caches = _build_coco_match_cache(gt_dataset, predictions, iou_type, include_ap30)
     point_metrics = _accumulate_cached_sample(caches, sorted(image_ids), include_mar)
     if progress_label:
         print(f"[timing] {progress_label}: matching cache {time.perf_counter() - started:.2f}s", flush=True)
