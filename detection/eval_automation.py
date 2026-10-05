@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import numpy as np
@@ -85,19 +86,27 @@ def compute_aji_dice(gt_instance_masks, pred_instance_masks):
     if not gt or not pred:
         return {"aji": 0.0, "dice": 0.0}
 
+    gt_rles = [mask_utils.encode(np.asfortranarray(mask, dtype=np.uint8)) for mask in gt]
+    pred_rles = [mask_utils.encode(np.asfortranarray(mask, dtype=np.uint8)) for mask in pred]
+    gt_areas = np.asarray(mask_utils.area(gt_rles), dtype=np.float64)
+    pred_areas = np.asarray(mask_utils.area(pred_rles), dtype=np.float64)
+    pair_ious = mask_utils.iou(gt_rles, pred_rles, [0] * len(pred))
+    # IoU = intersection / (area_gt + area_pred - intersection).
+    pair_intersections = pair_ious * (gt_areas[:, None] + pred_areas[None, :]) / (1 + pair_ious)
+    pair_intersections = np.rint(pair_intersections)
+
     unmatched_pred = set(range(len(pred)))
     aji_intersection = 0.0
     aji_union = 0.0
 
-    for gt_mask in gt:
+    for gt_idx, gt_mask in enumerate(gt):
         best_idx = None
         best_intersection = 0.0
         best_union = 0.0
         best_iou = 0.0
         for pred_idx in unmatched_pred:
-            pred_mask = pred[pred_idx]
-            intersection = float(np.logical_and(gt_mask, pred_mask).sum())
-            union = float(np.logical_or(gt_mask, pred_mask).sum())
+            intersection = float(pair_intersections[gt_idx, pred_idx])
+            union = float(gt_areas[gt_idx] + pred_areas[pred_idx] - intersection)
             if union <= 0.0:
                 continue
             iou = intersection / union
@@ -183,28 +192,26 @@ def compute_aji_dice_image_values_from_coco_dict(gt_dataset, predictions):
         image_id = annotation["image_id"]
         if image_id not in image_meta:
             continue
-        height, width = image_meta[image_id]
-        decoded = _decode_annotation_to_mask(annotation, height, width)
-        if decoded is None or not np.any(decoded):
-            continue
-        gt_by_image.setdefault(image_id, []).append(decoded)
+        gt_by_image.setdefault(image_id, []).append(annotation)
 
     pred_by_image = {}
     for prediction in predictions:
         image_id = prediction["image_id"]
         if image_id not in image_meta:
             continue
-        height, width = image_meta[image_id]
-        decoded = _decode_prediction_to_mask(prediction, height, width)
-        if decoded is None or not np.any(decoded):
-            continue
-        pred_by_image.setdefault(image_id, []).append(decoded)
+        pred_by_image.setdefault(image_id, []).append(prediction)
 
     all_image_ids = sorted(set(image_meta.keys()))
     aji_values = []
     dice_values = []
     for image_id in all_image_ids:
-        local = compute_aji_dice(gt_by_image.get(image_id, []), pred_by_image.get(image_id, []))
+        height, width = image_meta[image_id]
+        gt_masks = [_decode_annotation_to_mask(ann, height, width)
+                    for ann in gt_by_image.get(image_id, [])]
+        pred_masks = [_decode_prediction_to_mask(pred, height, width)
+                      for pred in pred_by_image.get(image_id, [])]
+        local = compute_aji_dice([m for m in gt_masks if m is not None],
+                                [m for m in pred_masks if m is not None])
         aji_values.append(float(local["aji"]))
         dice_values.append(float(local["dice"]))
     return {"aji_values": aji_values, "dice_values": dice_values}
@@ -266,7 +273,8 @@ def _build_coco_api_from_dataset_dict(gt_dataset):
 
 def _load_coco_results(coco_gt, predictions):
     if predictions:
-        return coco_gt.loadRes(predictions)
+        # loadRes adds bbox/area/id in place; do not mutate caller predictions.
+        return coco_gt.loadRes(copy.deepcopy(predictions))
 
     # pycocotools expects at least one prediction-like entry. Use impossible score to ensure no matches.
     categories = coco_gt.dataset.get("categories", [])
@@ -369,6 +377,69 @@ def _evaluate_coco_bootstrap_sample(args):
     )
 
 
+def _build_coco_match_cache(gt_dataset, predictions, iou_type, include_ap30, include_mar=True):
+    """Compute image-local matching once; bootstrap only repeats accumulation."""
+    coco_gt = _build_coco_api_from_dataset_dict(gt_dataset)
+    coco_dt = _load_coco_results(coco_gt, predictions)
+    caches = []
+    modes = ['default'] + (['ap30'] if include_ap30 else []) + (['mar'] if include_mar else [])
+    for mode in modes:
+        evaluator = COCOeval(coco_gt, coco_dt, iouType=iou_type)
+        if mode == 'mar':
+            # Preserve main's category-agnostic proposal recall definition.
+            evaluator.params.useCats = 0
+        if mode == 'ap30':
+            evaluator.params.iouThrs = np.array([0.3], dtype=np.float64)
+        with contextlib.redirect_stdout(io.StringIO()):
+            evaluator.evaluate()
+        caches.append((evaluator._paramsEval, evaluator.evalImgs))
+    return caches
+
+
+def _accumulate_cached_sample(caches, sampled_ids, include_mar):
+    metrics = {}
+    for cache_idx, (params, images) in enumerate(caches):
+        evaluator = COCOeval(iouType=params.iouType)
+        evaluator.params = copy.deepcopy(params)
+        # Unique synthetic IDs preserve draw order and repeated images. Merely
+        # passing repeated original IDs would lose multiplicity in COCOeval.
+        evaluator.params.imgIds = list(range(1, len(sampled_ids) + 1))
+        evaluator._paramsEval = copy.deepcopy(evaluator.params)
+        positions = {image_id: idx for idx, image_id in enumerate(params.imgIds)}
+        n_images = len(params.imgIds)
+        evaluator.evalImgs = [
+            images[offset + positions[int(image_id)]]
+            for offset in range(0, len(images), n_images)
+            for image_id in sampled_ids
+        ]
+        with contextlib.redirect_stdout(io.StringIO()):
+            evaluator.accumulate()
+            evaluator.summarize()
+        if not params.useCats:
+            if include_mar:
+                metrics['mAR'] = float(evaluator.stats[8])
+        elif cache_idx == 0:
+            metrics.update(mAP=float(evaluator.stats[0]), AP50=float(evaluator.stats[1]))
+        else:
+            metrics['AP30'] = float(evaluator.stats[0])
+    return metrics
+
+
+_BOOTSTRAP_MATCH_CACHE = None
+_BOOTSTRAP_INCLUDE_MAR = False
+
+
+def _init_cached_bootstrap_worker(caches, include_mar):
+    global _BOOTSTRAP_MATCH_CACHE, _BOOTSTRAP_INCLUDE_MAR
+    _BOOTSTRAP_MATCH_CACHE = caches
+    _BOOTSTRAP_INCLUDE_MAR = include_mar
+
+
+def _cached_bootstrap_worker(sampled_ids):
+    return _accumulate_cached_sample(
+        _BOOTSTRAP_MATCH_CACHE, sampled_ids, _BOOTSTRAP_INCLUDE_MAR)
+
+
 def bootstrap_ci_from_coco_predictions(
     gt_dataset,
     predictions,
@@ -391,13 +462,11 @@ def bootstrap_ci_from_coco_predictions(
     if n_resamples <= 0:
         raise ValueError("n_resamples must be > 0")
 
-    point_metrics = _evaluate_coco_metric_set(
-        gt_dataset=gt_dataset,
-        predictions=predictions,
-        iou_type=iou_type,
-        include_ap30=include_ap30,
-        include_mar=include_mar,
-    )
+    started = time.perf_counter()
+    caches = _build_coco_match_cache(gt_dataset, predictions, iou_type, include_ap30, include_mar)
+    point_metrics = _accumulate_cached_sample(caches, sorted(image_ids), include_mar)
+    if progress_label:
+        print(f"[timing] {progress_label}: matching cache {time.perf_counter() - started:.2f}s", flush=True)
     metric_names = list(point_metrics.keys())
     bootstrap_samples = {name: [] for name in metric_names}
 
@@ -408,30 +477,32 @@ def bootstrap_ci_from_coco_predictions(
         [image_ids[int(i)] for i in rng.integers(0, n_images, size=n_images)]
         for _ in range(n_resamples)
     ]
-    sample_args = [
-        (gt_dataset, predictions, sampled_ids, iou_type, include_ap30,
-         include_mar) for sampled_ids in sampled_ids_list
-    ]
+    resampling_started = time.perf_counter()
+
+    def collect(sample_metrics_iter):
+        for sample_idx, sample_metrics in enumerate(sample_metrics_iter):
+            for name in metric_names:
+                bootstrap_samples[name].append(float(sample_metrics[name]))
+            if progress_label and (sample_idx == 0 or sample_idx + 1 == n_resamples
+                                   or (sample_idx + 1) % progress_step == 0):
+                print(f"[bootstrap] {progress_label}: {sample_idx + 1}/{n_resamples}", flush=True)
+
     if n_jobs is None or int(n_jobs) <= 1:
-        sample_metrics_iter = map(_evaluate_coco_bootstrap_sample, sample_args)
+        collect(_accumulate_cached_sample(caches, ids, include_mar)
+                for ids in sampled_ids_list)
     else:
-        with ProcessPoolExecutor(max_workers=int(n_jobs)) as executor:
-            sample_metrics_iter = executor.map(
-                _evaluate_coco_bootstrap_sample, sample_args)
+        # Send matching tables once per worker, not full annotations and
+        # predictions for every draw. Consume results while the pool is alive.
+        with ProcessPoolExecutor(max_workers=int(n_jobs),
+                                 mp_context=get_context('spawn'),
+                                 initializer=_init_cached_bootstrap_worker,
+                                 initargs=(caches, include_mar)) as executor:
+            collect(executor.map(_cached_bootstrap_worker, sampled_ids_list,
+                                 chunksize=max(1, n_resamples // (int(n_jobs) * 8))))
 
-    for sample_idx, sample_metrics in enumerate(sample_metrics_iter):
-        for name in metric_names:
-            bootstrap_samples[name].append(float(sample_metrics[name]))
-        if progress_label and (
-            sample_idx == 0
-            or sample_idx + 1 == n_resamples
-            or (sample_idx + 1) % progress_step == 0
-        ):
-            print(
-                f"[bootstrap] {progress_label}: {sample_idx + 1}/{n_resamples}",
-                flush=True,
-            )
-
+    if progress_label:
+        print(f"[timing] {progress_label}: {n_resamples} bootstrap draws "
+              f"{time.perf_counter() - resampling_started:.2f}s ({n_jobs} workers)", flush=True)
     merged = {}
     for name in metric_names:
         values = np.asarray(bootstrap_samples[name], dtype=np.float64)

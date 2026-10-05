@@ -128,3 +128,114 @@ def test_detection_coco_bootstrap_parallel_matches_serial():
     )
 
     assert parallel == serial
+
+
+def _matching_edge_case_dataset(iou_type):
+    from pycocotools import mask as mask_utils
+
+    gt = {'images': [], 'annotations': [], 'categories': [
+        {'id': 1, 'name': 'cell'}, {'id': 2, 'name': 'other'}], 'info': {}}
+    predictions = []
+    ann_id = 1
+    for idx, image_id in enumerate([41, 8, 3, 90, 12]):
+        gt['images'].append({'id': image_id, 'width': 32, 'height': 32})
+        # Last image has no GT; category 2 is absent in some draws.
+        if idx != 4:
+            for category in ([1, 2] if idx == 0 else [1]):
+                ann = {'id': ann_id, 'image_id': image_id, 'category_id': category,
+                       'bbox': [2, 2, 10, 10], 'area': 100, 'iscrowd': int(idx == 2)}
+                mask = np.zeros((32, 32), dtype=np.uint8)
+                mask[2:12, 2:12] = 1
+                ann['segmentation'] = mask_utils.encode(np.asfortranarray(mask))
+                gt['annotations'].append(ann)
+                ann_id += 1
+        # Equal scores, false positives, and enough predictions to exercise maxDets.
+        for n in range(105 if idx == 0 else 3):
+            x = 2 if n == 0 else 5 + n % 12
+            mask = np.zeros((32, 32), dtype=np.uint8)
+            mask[2:12, x:x + 10] = 1
+            pred = {'image_id': image_id, 'category_id': 1 if n % 2 == 0 else 2,
+                    'score': 0.8 if n < 2 else 0.4, 'bbox': [x, 2, 10, 10]}
+            if iou_type == 'segm':
+                pred['segmentation'] = mask_utils.encode(np.asfortranarray(mask))
+            predictions.append(pred)
+    return gt, predictions
+
+
+def test_cached_coco_matches_full_resampling_with_duplicates_crowds_and_ties():
+    from eval_automation import (
+        _build_coco_match_cache, _accumulate_cached_sample,
+        _evaluate_coco_bootstrap_sample,
+    )
+    for kind in ('bbox', 'segm'):
+        gt, predictions = _matching_edge_case_dataset(kind)
+        for preds in (predictions, []):
+            cache = _build_coco_match_cache(gt, preds, kind, True)
+            for draw in ([8, 41, 8, 3, 12], [12] * 5, [3, 90, 3, 90, 8], [41] * 5):
+                expected = _evaluate_coco_bootstrap_sample((gt, preds, draw, kind, True, True))
+                actual = _accumulate_cached_sample(cache, draw, True)
+                assert actual.keys() == expected.keys()
+                for name in expected:
+                    np.testing.assert_allclose(actual[name], expected[name], atol=1e-12, rtol=0)
+
+
+def _dense_aji_reference(gt, pred):
+    gt = [m.astype(bool) for m in gt if m.any()]
+    pred = [m.astype(bool) for m in pred if m.any()]
+    if not gt and not pred:
+        return {'aji': 1.0, 'dice': 1.0}
+    if not gt or not pred:
+        return {'aji': 0.0, 'dice': 0.0}
+    unmatched = set(range(len(pred)))
+    intersection_total = union_total = 0
+    for mask in gt:
+        best_idx, best_iou = None, 0
+        best_intersection = best_union = 0
+        for idx in unmatched:
+            intersection = np.logical_and(mask, pred[idx]).sum()
+            union = np.logical_or(mask, pred[idx]).sum()
+            iou = intersection / union
+            if iou > best_iou:
+                best_idx, best_iou = idx, iou
+                best_intersection, best_union = intersection, union
+        if best_idx is None:
+            union_total += mask.sum()
+        else:
+            unmatched.remove(best_idx)
+            intersection_total += best_intersection
+            union_total += best_union
+    union_total += sum(pred[idx].sum() for idx in unmatched)
+    merged_gt, merged_pred = np.logical_or.reduce(gt), np.logical_or.reduce(pred)
+    return {'aji': intersection_total / union_total,
+            'dice': 2 * np.logical_and(merged_gt, merged_pred).sum() /
+                    (merged_gt.sum() + merged_pred.sum())}
+
+
+def test_rle_aji_preserves_dense_greedy_matching():
+    from eval_automation import compute_aji_dice
+    rng = np.random.default_rng(123)
+    cases = [([], []), ([np.ones((24, 24), dtype=bool)], []),
+             ([], [np.zeros((24, 24), dtype=bool)])]
+    for _ in range(30):
+        cases.append(([rng.random((24, 24)) > 0.8 for _ in range(5)],
+                      [rng.random((24, 24)) > 0.8 for _ in range(7)]))
+    # Identical IoUs exercise the existing tie-breaking behavior.
+    mask = np.zeros((24, 24), dtype=bool)
+    mask[2:12, 2:12] = True
+    cases.append(([mask, mask], [mask, mask, mask]))
+    for gt, pred in cases:
+        expected, actual = _dense_aji_reference(gt, pred), compute_aji_dice(gt, pred)
+        for name in expected:
+            np.testing.assert_allclose(actual[name], expected[name], atol=1e-12, rtol=0)
+
+
+def test_segmentation_predictions_without_bbox_are_not_mutated():
+    import copy
+    gt, preds = _matching_edge_case_dataset('segm')
+    for pred in preds:
+        del pred['bbox']
+    original = copy.deepcopy(preds)
+    first = bootstrap_ci_from_coco_predictions(gt, preds, 'segm', n_resamples=10)
+    second = bootstrap_ci_from_coco_predictions(gt, preds, 'segm', n_resamples=10)
+    assert first == second
+    assert preds == original
