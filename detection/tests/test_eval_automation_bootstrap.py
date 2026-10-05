@@ -239,3 +239,25 @@ def test_segmentation_predictions_without_bbox_are_not_mutated():
     second = bootstrap_ci_from_coco_predictions(gt, preds, 'segm', n_resamples=10)
     assert first == second
     assert preds == original
+
+
+
+def test_detection_mar_requires_correct_category():
+    from eval_automation import _evaluate_coco_metric_set
+    gt = {
+        'info': {},
+        'images': [{'id': 1, 'width': 32, 'height': 32}],
+        'categories': [{'id': 1, 'name': 'WBC'}, {'id': 2, 'name': 'RBC'}],
+        'annotations': [{'id': 1, 'image_id': 1, 'category_id': 1,
+                         'bbox': [2, 2, 10, 10], 'area': 100, 'iscrowd': 0}],
+    }
+    wrong = [{'image_id': 1, 'category_id': 2, 'bbox': [2, 2, 10, 10], 'score': 0.99}]
+    right = [dict(wrong[0], category_id=1)]
+    for predictions, expected in ((wrong, 0.0), (right, 1.0)):
+        ordinary = _evaluate_coco_metric_set(gt, predictions, 'bbox', include_mar=True)
+        bootstrapped = bootstrap_ci_from_coco_predictions(
+            gt, predictions, 'bbox', n_resamples=10, include_mar=True)
+        assert ordinary['mAR'] == expected
+        assert bootstrapped['mAR']['point_estimate'] == expected
+        assert bootstrapped['mAR']['original_point_estimate'] == expected
+        assert bootstrapped['mAR']['ci95'] == {'lower': expected, 'upper': expected}
