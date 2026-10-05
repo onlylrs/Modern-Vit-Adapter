@@ -103,6 +103,28 @@ reports mAP, AP30, AP50, and mAR; segmentation reports AJI, Dice, mAP, and
 AP50. CBC is an external detection test using TXL-PBC's checkpoint. Its class
 order is mapped to the TXL-PBC head (WBC, RBC, Platelets).
 
+Validation for Mask R-CNN computes AJI and Dice each epoch; COCO mask AP
+is computed only in final testing. Detection still validates bbox mAP each
+epoch. AJI uses RLE pairwise intersections with the same greedy matching rule,
+and masks are decoded one image at a time. AP bootstrap caches image-local
+COCO matching once and repeats only accumulation, preserving repeated-image
+sampling and score tie order. It does not average per-image AP.
+
+The queue defaults to 1000 bootstrap draws, up to four CPU workers per
+experiment, and four dataloader workers for training, validation and testing.
+Set these before `prepare`/`start` to tune resource use:
+
+```bash
+export CROWN_BOOTSTRAP_RESAMPLES=1000
+export CROWN_BOOTSTRAP_JOBS=4
+export CROWN_EVAL_WORKERS=4
+```
+
+Multiple simultaneous experiments each use their own workers. Reduce the
+worker counts if CPU or RAM becomes constrained. The bootstrap log reports
+matching-cache and resampling times separately. `prepare` and `start` also
+update existing unfinished-job configs to the AJI validation setting.
+
 The runner probes the NAS dataset directory every 15 seconds with a time
 limit, independent of filesystem type. After three consecutive failures,
 active process groups stop and their rows become `paused_mount`. Restore NAS

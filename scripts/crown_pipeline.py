@@ -39,6 +39,11 @@ STATE = Path(os.environ.get('CROWN_STATE_ROOT', REPO / 'work_dirs/crown_pipeline
 GPUS = tuple(int(gpu.strip()) for gpu in os.environ.get('CROWN_GPUS', '4,5,6,7').split(','))
 if not GPUS or len(set(GPUS)) != len(GPUS) or any(gpu < 0 for gpu in GPUS):
     raise ValueError('CROWN_GPUS must contain distinct nonnegative GPU indices')
+BOOTSTRAP_RESAMPLES = int(os.environ.get('CROWN_BOOTSTRAP_RESAMPLES', '1000'))
+BOOTSTRAP_JOBS = int(os.environ.get('CROWN_BOOTSTRAP_JOBS', str(min(4, os.cpu_count() or 1))))
+EVAL_WORKERS = int(os.environ.get('CROWN_EVAL_WORKERS', '4'))
+if BOOTSTRAP_RESAMPLES <= 0 or BOOTSTRAP_JOBS <= 0 or EVAL_WORKERS < 0:
+    raise ValueError('Bootstrap counts must be positive and evaluation workers nonnegative')
 FIELDS = ('task', 'dataset', 'train_images', 'status', 'phase', 'gpu', 'pid',
           'best_ckpt', 'metrics_json', 'message', 'updated_at')
 
@@ -405,7 +410,7 @@ def render_config(job, splits, classes):
             f"    {split}=dict(type={kind!r}, ann_file={str(ann)!r}, "
             f"img_prefix={str(prefix) + '/'!r}, classes=classes),")
     monitor = 'bbox_mAP' if job.task == 'det' else 'AJI'
-    metric = 'bbox' if job.task == 'det' else 'segm'
+    metric = 'bbox' if job.task == 'det' else 'AJI'
     head = f"bbox_head=dict(num_classes={len(classes)})"
     if job.task == 'seg':
         head += f", mask_head=dict(num_classes={len(classes)})"
@@ -415,7 +420,7 @@ def render_config(job, splits, classes):
         f'model = dict(backbone=dict(pretrained={str(LOCAL_CKPT)!r}, '
         f'official_root={str(OFFICIAL_ROOT)!r}), '
         f'roi_head=dict({head}))',
-        'data = dict(workers_per_gpu=2,', *entries, ')',
+        f'data = dict(workers_per_gpu={EVAL_WORKERS},', *entries, ')',
         f"evaluation = dict(interval=1, metric={metric!r}, save_best={monitor!r}, "
         f"rule='greater', early_stop_metric={monitor!r}, early_stop_patience=5)",
         'checkpoint_config = dict(interval=1, max_keep_ckpts=2, save_last=True)',
@@ -459,6 +464,11 @@ def prepare(rows):
                         break
             if str(PUBLIC) not in config_text:
                 raise ValueError(f'{job.config}: cannot update dataset root to {PUBLIC}')
+            if job.task == 'seg':
+                config_text = config_text.replace("metric='segm'", "metric='AJI'")
+            config_text = re.sub(r'workers_per_gpu=\d+',
+                                 f'workers_per_gpu={EVAL_WORKERS}', config_text)
+            job.config.write_text(config_text, encoding='utf-8')
             if str(LOCAL_CKPT) not in config_text or str(OFFICIAL_ROOT) not in config_text:
                 job.config.write_text(
                     config_text + f"\nmodel['backbone'] = dict(pretrained={str(LOCAL_CKPT)!r}, "
@@ -627,9 +637,9 @@ def command_for(job, phase, gpu):
         cmd = [sys.executable, str(REPO / 'detection/eval_automation.py'),
                '--task', 'detection' if job.task == 'det' else 'segmentation',
                '--experiment-dir', str(job.work), '--config', str(job.config),
-               '--checkpoint-select', 'final', '--bootstrap-resamples', '1000',
-               '--bootstrap-seed', '42', '--bootstrap-jobs', '1', '--low-mem',
-               '--samples-per-gpu', '1', '--workers-per-gpu', '1',
+               '--checkpoint-select', 'final', '--bootstrap-resamples', str(BOOTSTRAP_RESAMPLES),
+               '--bootstrap-seed', '42', '--bootstrap-jobs', str(BOOTSTRAP_JOBS), '--low-mem',
+               '--samples-per-gpu', '1', '--workers-per-gpu', str(EVAL_WORKERS),
                '--cuda-visible-devices', str(gpu)]
         cwd = REPO
     else:

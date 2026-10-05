@@ -10,8 +10,9 @@ from mmdet.datasets.builder import DATASETS
 @DATASETS.register_module()
 class CrownInstanceCocoDataset(CocoDataset):
     def evaluate(self, results, metric='segm', **kwargs):
-        metrics = super().evaluate(results, metric=metric, **kwargs)
-        if metric != 'segm':
+        # Validation selects on AJI; skip unrelated COCO AP computation.
+        metrics = {} if metric == 'AJI' else super().evaluate(results, metric=metric, **kwargs)
+        if metric not in ('segm', 'AJI'):
             return metrics
         from eval_automation import compute_aji_dice_from_coco_json
 

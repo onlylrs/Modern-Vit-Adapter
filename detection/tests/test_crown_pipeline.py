@@ -82,6 +82,39 @@ class NativeNasTests(unittest.TestCase):
             self.assertEqual(list(external.work.glob('*.pth')), [])
             self.assertFalse((Path(root) / 'local').exists())
 
+    def test_prepare_updates_existing_segmentation_validation_without_resetting_progress(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(pipeline, 'STATE', Path(root)), \
+                patch.object(pipeline, 'mount_healthy', return_value=True):
+            job = pipeline.BY_KEY['seg_bttfa']
+            (Path(root) / 'configs').mkdir()
+            job.config.write_text(
+                f"data_root = {str(pipeline.PUBLIC)!r}\n"
+                f"model = dict(backbone=dict(pretrained={str(pipeline.LOCAL_CKPT)!r}, "
+                f"official_root={str(pipeline.OFFICIAL_ROOT)!r}))\n"
+                "data = dict(workers_per_gpu=2)\n"
+                "evaluation = dict(metric='segm', save_best='AJI', early_stop_patience=5)\n")
+            rows = {job.key: dict(train_images='72', status='stopped')}
+            with patch.object(pipeline, 'JOBS', (job,)):
+                pipeline.prepare(rows)
+            text = job.config.read_text()
+            self.assertIn("metric='AJI'", text)
+            self.assertIn("save_best='AJI'", text)
+            self.assertIn('early_stop_patience=5', text)
+            self.assertIn(f'workers_per_gpu={pipeline.EVAL_WORKERS}', text)
+            self.assertEqual(rows[job.key]['status'], 'stopped')
+
+    def test_eval_command_uses_configurable_bootstrap_and_workers(self):
+        job = pipeline.BY_KEY['det_apcdata']
+        with patch.object(pipeline, 'best_checkpoint'), \
+                patch.object(pipeline, 'BOOTSTRAP_RESAMPLES', 100), \
+                patch.object(pipeline, 'BOOTSTRAP_JOBS', 2), \
+                patch.object(pipeline, 'EVAL_WORKERS', 3):
+            cmd, _, _ = pipeline.command_for(job, 'eval', 1)
+        for flag, expected in (('--bootstrap-resamples', '100'),
+                               ('--bootstrap-jobs', '2'), ('--workers-per-gpu', '3')):
+            self.assertEqual(cmd[cmd.index(flag) + 1], expected)
+
     def test_worker_inherits_resolved_paths_and_staging_setting(self):
         with patch.object(pipeline, 'STAGE_INPUTS', False):
             _, _, env = pipeline.command_for(pipeline.BY_KEY['det_apcdata'], 'sync', None)
