@@ -1,6 +1,13 @@
 # Installation Guide
 Any env manager works (e.g. conda, miniconda, mamba, micromamba, uv). [Micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html) is shown as the example.
 
+Compile MMCV and MultiScaleDeformableAttention on each new machine after
+installing its Python, PyTorch and CUDA environment. Generated `build/`
+directories, `.so` libraries and object files are ignored by Git; keep them
+locally and do not commit them. Rebuild after changing Python, PyTorch, CUDA,
+or the target GPU architecture. The repository tracks the source and build
+scripts needed to reproduce these extensions.
+
 Create environment:
 ```bash
 micromamba create -n torch29 python=3.12

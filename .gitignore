@@ -1,4 +1,14 @@
 **/__pycache__/
+# Machine-specific Python/CUDA build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+*.py[cod]
+.ninja_deps
+.ninja_log
 work_dirs/
 my-configs/*
 !my-configs/coco2017_fasterrcnn_dinov3.py
