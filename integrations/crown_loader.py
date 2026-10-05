@@ -38,9 +38,8 @@ def load_crown(checkpoint: str | Path, official_root: str | Path):
         patch_size=16, img_size=224, init_values=1.0,
         block_chunks=4, ffn_layer="swiglufused",
     )
-    # Memory-mapping a checkpoint on sshfs can SIGBUS if the mount drops while
-    # tensors are copied to a GPU. The experiment runner stages it locally;
-    # regular loading also keeps manual use safe from that failure mode.
+    # Load tensors into CPU memory instead of retaining a memory map of the
+    # NAS file while transferring tensors to a GPU.
     state = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(state, strict=True, assign=True)
     return model

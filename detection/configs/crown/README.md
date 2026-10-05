@@ -33,11 +33,11 @@ python train.py configs/faster_rcnn/faster_rcnn_crown_adapter_large_fpn_1x_coco.
 
 ## Full dataset queue
 
-The one-command runner discovers each requested COCO split and writes local
-configs and a progress CSV. It schedules the smallest training sets first and
-uses physical GPUs 4, 5, 6, and 7, with one experiment process per GPU.
-It detects whether sshfs is rooted at `/jhcnas6` or
-`/jhcnas6/Cytology` and adjusts the NAS paths accordingly.
+The runner discovers each COCO split, writes configs and progress CSVs, and
+schedules the smallest training sets first. It reads directly from the native
+NFS mount on this machine; no sshfs mount or local dataset copy is required.
+The default physical GPUs are 4, 5, 6, and 7, one experiment per GPU. Override
+these with `CROWN_GPUS=0,1,2,3` (or another comma-separated list).
 
 ```bash
 scripts/crown_pipeline.sh prepare  # validate splits and generate configs
@@ -46,40 +46,48 @@ scripts/crown_pipeline.sh status   # show progress and output paths
 scripts/crown_pipeline.sh stop     # stop all queue processes
 ```
 
-The launcher uses the existing `torch29` Python directly. Override it with
-`CROWN_PYTHON` if the environment moves.
+The launcher resolves Python from the micromamba `torch29` environment using
+`MAMBA_ROOT_PREFIX` or `~/micromamba`, with `micromamba run` as a fallback.
+Set `CROWN_PYTHON` to use an explicit Python executable.
 
-Before scheduling any jobs, the runner copies the 1.2 GB CROWN source
-checkpoint to `/homes/rliuar/work/2_Temp/crown_runs/pretrained/CROWN.pth`,
-checks its size and ZIP CRC, then points generated configs at that local copy.
-This avoids memory-mapped reads from sshfs during GPU startup. An interrupted
-copy resumes on the next `start`. Archived configs point back to the NAS
-source, and the staged copy is removed after all tasks complete.
+Default paths on this machine:
 
-Each job first copies its COCO JSON files and only the referenced images to
-`/homes/rliuar/work/2_Temp/crown_runs/data/<task>`. The copy uses rsync and
-continues from partial files on the next `start`. Training and test then read
-the local copy, avoiding intermittent sshfs image read errors. One data copy
-runs at a time. The local data copy is removed after that job has been
-archived successfully.
-Data copying and checkpoint archiving use separate CPU workers, leaving all
-four GPU slots available for experiments when datasets are ready.
+| Purpose | Default | Override |
+| --- | --- | --- |
+| COCO datasets | `/jhcnas6/Public` | `CROWN_PUBLIC_ROOT` |
+| Pretrained weights | `/jhcnas6/Private/temp/X_Ckpts/crown_ckpts/CROWN.pth` | `CROWN_PRETRAINED_CKPT` |
+| Official CROWN source | `~/0_Official/CROWN` | `CROWN_OFFICIAL_ROOT` |
+| NAS archive | `/jhcnas6/Cytology/smartcyto_baseline/crown` | `CROWN_ARCHIVE_ROOT` |
+| Local training, evaluation, logs | `<repo>/work_dirs/crown_runs` | `CROWN_LOCAL_ROOT` |
+| Generated configs and progress CSVs | `<repo>/work_dirs/crown_pipeline` | `CROWN_STATE_ROOT` |
 
-The progress files are `work_dirs/crown_pipeline/status.csv` and
-`work_dirs/crown_pipeline/results.csv`. The latter contains one row per metric
-with its mean and 95% bootstrap interval. Each task's logs and checkpoint
-resumption files live under `/homes/rliuar/work/2_Temp/crown_runs` and are
-synced to the NAS `smartcyto_baseline/crown/{det,seg}` directory. Local
-checkpoints are deleted only after `rsync` succeeds. Set `CROWN_LOCAL_ROOT`,
-`CROWN_STATE_ROOT`, `CROWN_PUBLIC_ROOT`, or `CROWN_ARCHIVE_ROOT` to override
-those paths.
-Checkpoint archiving also retries interrupted sshfs writes with resumable
-rsync transfers. It does not request NAS owner, group, or permission changes,
-and keeps local checkpoints until the full archive succeeds. Only the best
-validation checkpoint is archived; intermediate epoch checkpoints are removed
-locally after that succeeds.
-The TXL-PBC best checkpoint stays in the local temporary directory until
-CBC's external test completes, so that test does not load a model across sshfs.
+`CROWN_MOUNTPOINT` changes the default NAS root (`/jhcnas6`). Individual path
+variables take precedence. The templates also honor `CROWN_PRETRAINED_CKPT`
+and `CROWN_OFFICIAL_ROOT` when launched manually.
+
+`prepare` only needs readable datasets. Before `start` launches experiments,
+the runner checks CUDA device availability, official source, rsync, and NAS
+archive permissions. The current archive parent must be accessible and
+writable by your account. If it is restricted, fix its permissions or set
+`CROWN_ARCHIVE_ROOT` to an accessible destination before starting.
+
+The runner reads JSON files, images, and pretrained weights directly from
+NAS by default. It loads pretrained tensors into CPU memory without memory
+mapping. Set `CROWN_STAGE_INPUTS=1` before `prepare` and `start` to retain the
+old resumable local staging mode for slower or unreliable storage. Use the
+same setting throughout a run. That mode copies the pretrained checkpoint to
+`<local>/pretrained/CROWN.pth`, verifies its ZIP CRC, and stages only the images
+referenced in each dataset's COCO JSON. A separate CPU worker copies data,
+and removes staged inputs after successful archiving. The NAS source files
+are never removed.
+
+Progress is recorded in `status.csv` and `results.csv` under the state root.
+The latter contains one row per metric with its mean and 95% bootstrap
+interval. Checkpoint archiving uses a separate CPU worker, leaving GPU slots
+available for experiments. Resumable rsync transfers do not request NAS
+owner, group, or permission changes. Only the best validation checkpoint is
+archived; intermediate local checkpoints are removed after archiving succeeds.
+The TXL-PBC best checkpoint remains local until CBC's external test completes.
 
 Faster R-CNN selects `bbox_mAP` on validation. Mask R-CNN selects AJI on
 validation. Both use the 1x schedule, validate each epoch, and stop after five
@@ -89,11 +97,10 @@ reports mAP, AP30, AP50, and mAR; segmentation reports AJI, Dice, mAP, and
 AP50. CBC is an external detection test using TXL-PBC's checkpoint. Its class
 order is mapped to the TXL-PBC head (WBC, RBC, Platelets).
 
-The runner checks the sshfs mount every 15 seconds. If it disappears, active
-process groups are stopped and their rows become `paused_mount`. Remount the
-NAS and run `start` again; training resumes from `latest.pth`, while finished
-stages are skipped. A failed task can likewise be retried with `start` after
-the underlying issue is fixed.
-The health check also probes dataset and archive directories with a time
-limit, since an sshfs mount can remain listed while file reads hang. Set
-`CROWN_MOUNTPOINT` if the mount path moves.
+The runner probes the NAS dataset directory every 15 seconds with a time
+limit, independent of filesystem type. After three consecutive failures,
+active process groups stop and their rows become `paused_mount`. Restore NAS
+access and run `start` again; training resumes from `latest.pth` and completed
+stages are skipped. A failed task can also be retried with `start` after
+fixing its underlying issue. Archive retries retain local checkpoints until
+transfer succeeds.

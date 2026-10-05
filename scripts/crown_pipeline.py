@@ -22,19 +22,23 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
-PUBLIC = Path(os.environ.get('CROWN_PUBLIC_ROOT', '/homes/rliuar/work/mnt/nas6/Cytology/Public'))
+MOUNTPOINT = Path(os.environ.get('CROWN_MOUNTPOINT', '/jhcnas6')).expanduser()
+PUBLIC = Path(os.environ.get('CROWN_PUBLIC_ROOT', MOUNTPOINT / 'Public')).expanduser()
 ARCHIVE = Path(os.environ.get(
-    'CROWN_ARCHIVE_ROOT',
-    '/homes/rliuar/work/mnt/nas6/Cytology/Cytology/smartcyto_baseline/crown'))
-LOCAL = Path(os.environ.get('CROWN_LOCAL_ROOT', '/homes/rliuar/work/2_Temp/crown_runs'))
+    'CROWN_ARCHIVE_ROOT', MOUNTPOINT / 'Cytology/smartcyto_baseline/crown')).expanduser()
+LOCAL = Path(os.environ.get('CROWN_LOCAL_ROOT', REPO / 'work_dirs/crown_runs')).expanduser()
 REMOTE_CKPT = Path(os.environ.get(
     'CROWN_PRETRAINED_CKPT',
-    '/homes/rliuar/work/mnt/nas6/Cytology/Private/temp/X_Ckpts/crown_ckpts/CROWN.pth'))
-MOUNTPOINT = Path(os.environ.get('CROWN_MOUNTPOINT', '/homes/rliuar/work/mnt/nas6'))
-LOCAL_CKPT = LOCAL / 'pretrained/CROWN.pth'
+    MOUNTPOINT / 'Private/temp/X_Ckpts/crown_ckpts/CROWN.pth')).expanduser()
+STAGE_INPUTS = os.environ.get('CROWN_STAGE_INPUTS', '0') == '1'
+LOCAL_CKPT = LOCAL / 'pretrained/CROWN.pth' if STAGE_INPUTS else REMOTE_CKPT
 LOCAL_CKPT_VERIFIED = LOCAL_CKPT.with_suffix('.verified')
-STATE = Path(os.environ.get('CROWN_STATE_ROOT', REPO / 'work_dirs/crown_pipeline'))
-GPUS = (4, 5, 6, 7)
+OFFICIAL_ROOT = Path(os.environ.get(
+    'CROWN_OFFICIAL_ROOT', Path.home() / '0_Official/CROWN')).expanduser()
+STATE = Path(os.environ.get('CROWN_STATE_ROOT', REPO / 'work_dirs/crown_pipeline')).expanduser()
+GPUS = tuple(int(gpu.strip()) for gpu in os.environ.get('CROWN_GPUS', '4,5,6,7').split(','))
+if not GPUS or len(set(GPUS)) != len(GPUS) or any(gpu < 0 for gpu in GPUS):
+    raise ValueError('CROWN_GPUS must contain distinct nonnegative GPU indices')
 FIELDS = ('task', 'dataset', 'train_images', 'status', 'phase', 'gpu', 'pid',
           'best_ckpt', 'metrics_json', 'message', 'updated_at')
 
@@ -115,54 +119,50 @@ def now():
 
 
 def timed_run(command, timeout_seconds, **kwargs):
-    """Bound FUSE calls even when a dead sshfs makes the child unkillable."""
+    """Bound NAS calls even when a filesystem operation stalls."""
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, **kwargs)
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         process.kill()
-        # A process blocked inside FUSE can stay in D state after SIGKILL.
+        # A process blocked in filesystem I/O can stay in D state after SIGKILL.
         # Waiting for it here would freeze the whole experiment controller.
         raise
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def detect_mount_layout():
-    """Accept mounts rooted at either /jhcnas6 or /jhcnas6/Cytology."""
-    global PUBLIC, ARCHIVE, REMOTE_CKPT
-    if any(name in os.environ for name in (
-            'CROWN_PUBLIC_ROOT', 'CROWN_ARCHIVE_ROOT', 'CROWN_PRETRAINED_CKPT')):
-        return
-    for attempt in range(3):
-        for base in (MOUNTPOINT / 'Cytology', MOUNTPOINT):
-            try:
-                result = timed_run(
-                    ['test', '-d', str(base / 'Public')], 5,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if result.returncode == 0:
-                PUBLIC = base / 'Public'
-                REMOTE_CKPT = base / 'Private/temp/X_Ckpts/crown_ckpts/CROWN.pth'
-                ARCHIVE = base / 'Cytology/smartcyto_baseline/crown'
-                return
-        if attempt < 2:
-            time.sleep(2)
-
-
 def mount_healthy():
+    """Probe the data directory; native NFS need not be a FUSE mount."""
     try:
         result = timed_run(
-            ['findmnt', '-M', str(MOUNTPOINT), '-n', '-o', 'FSTYPE'], 5,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode or result.stdout.strip() != 'fuse.sshfs':
-            return False
-        result = timed_run(
-            ['stat', '-L', str(PUBLIC), str(ARCHIVE.parent)], 8,
+            ['stat', '-L', str(PUBLIC)], 8,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def validate_runtime():
+    """Reject unusable GPU/source/archive settings before launching jobs."""
+    import torch
+
+    count = torch.cuda.device_count()
+    if not torch.cuda.is_available() or any(gpu >= count for gpu in GPUS):
+        raise RuntimeError(
+            f'CROWN_GPUS={GPUS}, but PyTorch sees {count} CUDA devices; '
+            'check the driver/device access or set CROWN_GPUS')
+    if not (OFFICIAL_ROOT / 'models/vision_transformer.py').is_file():
+        raise FileNotFoundError(f'CROWN official source not found: {OFFICIAL_ROOT}')
+    if shutil.which('rsync') is None:
+        raise RuntimeError('rsync is required for checkpoint archiving')
+    result = timed_run(['mkdir', '-p', str(ARCHIVE)], 10,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode:
+        raise RuntimeError(
+            f'Cannot create archive {ARCHIVE}: {result.stderr.strip()}; '
+            'fix NAS permissions or set CROWN_ARCHIVE_ROOT')
+    if not os.access(ARCHIVE, os.W_OK | os.X_OK):
+        raise PermissionError(f'Archive is not writable: {ARCHIVE}; set CROWN_ARCHIVE_ROOT')
 
 
 def checkpoint_source_healthy():
@@ -257,13 +257,13 @@ def discover_bounded(job):
             [sys.executable, str(Path(__file__).resolve()), '--internal-discover', job.key],
             120, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except subprocess.TimeoutExpired as exc:
-        raise MountUnavailable(f'{job.dataset}: dataset discovery timed out on sshfs') from exc
+        raise MountUnavailable(f'{job.dataset}: dataset discovery timed out on NAS') from exc
     if result.returncode:
         raise RuntimeError(f'{job.dataset}: discovery worker failed: {result.stderr[-240:]}')
     payload = json.loads(result.stdout)
     if 'error' in payload:
         if payload.get('errno') in (errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.EPERM):
-            raise MountUnavailable(f'{job.dataset}: sshfs read failed: {payload["error"]}')
+            raise MountUnavailable(f'{job.dataset}: NAS read failed: {payload["error"]}')
         raise ValueError(payload['error'])
     splits = {name: (Path(row[0]), Path(row[1]), row[2], row[3])
               for name, row in payload['splits'].items()}
@@ -280,7 +280,7 @@ def run_resumable_copy(command):
             last_check = time.monotonic()
             if failed_checks >= 3:
                 process.terminate()
-                raise MountUnavailable('sshfs stopped responding during transfer')
+                raise MountUnavailable('NAS stopped responding during transfer')
         time.sleep(2)
     if process.returncode:
         raise MountUnavailable(f'rsync exited {process.returncode}; see phase log')
@@ -352,7 +352,7 @@ def stage_data(job):
 
 
 def stage_archive(job):
-    """Archive checkpoints and metrics with resumable sshfs writes."""
+    """Archive checkpoints and metrics with resumable NAS writes."""
     for attempt in range(5):
         try:
             mkdir = timed_run(
@@ -404,7 +404,8 @@ def render_config(job, splits, classes):
     return '\n'.join((
         f'_base_ = {str(base)!r}',
         f'classes = {classes!r}',
-        f'model = dict(backbone=dict(pretrained={str(LOCAL_CKPT)!r}), '
+        f'model = dict(backbone=dict(pretrained={str(LOCAL_CKPT)!r}, '
+        f'official_root={str(OFFICIAL_ROOT)!r}), '
         f'roi_head=dict({head}))',
         'data = dict(workers_per_gpu=2,', *entries, ')',
         f"evaluation = dict(interval=1, metric={metric!r}, save_best={monitor!r}, "
@@ -428,7 +429,7 @@ def prepare(rows):
         if attempt < 2:
             time.sleep(2)
     else:
-        raise MountUnavailable('sshfs mount unavailable; remount it and rerun start')
+        raise MountUnavailable('NAS data directory unavailable; check CROWN_PUBLIC_ROOT and rerun start')
     (STATE / 'configs').mkdir(parents=True, exist_ok=True)
     for job in JOBS:
         if rows[job.key]['status'] == 'complete':
@@ -450,9 +451,10 @@ def prepare(rows):
                         break
             if str(PUBLIC) not in config_text:
                 raise ValueError(f'{job.config}: cannot update dataset root to {PUBLIC}')
-            if str(LOCAL_CKPT) not in config_text:
+            if str(LOCAL_CKPT) not in config_text or str(OFFICIAL_ROOT) not in config_text:
                 job.config.write_text(
-                    config_text + f"\nmodel['backbone'] = dict(pretrained={str(LOCAL_CKPT)!r})\n",
+                    config_text + f"\nmodel['backbone'] = dict(pretrained={str(LOCAL_CKPT)!r}, "
+                    f"official_root={str(OFFICIAL_ROOT)!r})\n",
                     encoding='utf-8')
             if rows[job.key]['status'] in ('paused_mount', 'invalid_data'):
                 update(rows, job, status='queued', message='')
@@ -466,7 +468,7 @@ def prepare(rows):
         except Exception as exc:
             if isinstance(exc, MountUnavailable) or (isinstance(exc, OSError) and exc.errno in (
                     errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.EPERM)) or not mount_healthy():
-                raise MountUnavailable('sshfs unavailable while preparing datasets') from exc
+                raise MountUnavailable('NAS unavailable while preparing datasets') from exc
             update(rows, job, status='invalid_data', message=str(exc)[:240])
     return rows
 
@@ -527,7 +529,7 @@ def log_reports_mount_error(path, start=0):
         return False
     return (b'Input/output error' in output or
             b'Transport endpoint is not connected' in output or
-            b'sshfs stopped responding' in output or
+            b'NAS stopped responding' in output or
             b'cannot create NAS archive' in output or
             b'rsync exited' in output)
 
@@ -593,7 +595,8 @@ def command_for(job, phase, gpu):
     if phase in ('data', 'sync'):
         env.update(CROWN_PUBLIC_ROOT=str(PUBLIC), CROWN_ARCHIVE_ROOT=str(ARCHIVE),
                    CROWN_PRETRAINED_CKPT=str(REMOTE_CKPT), CROWN_LOCAL_ROOT=str(LOCAL),
-                   CROWN_STATE_ROOT=str(STATE), CROWN_MOUNTPOINT=str(MOUNTPOINT))
+                   CROWN_STATE_ROOT=str(STATE), CROWN_MOUNTPOINT=str(MOUNTPOINT),
+                   CROWN_STAGE_INPUTS='1' if STAGE_INPUTS else '0')
     if phase == 'data':
         cmd = [sys.executable, str(Path(__file__).resolve()),
                '--internal-stage', job.key]
@@ -629,7 +632,7 @@ def command_for(job, phase, gpu):
 
 
 def stage(job):
-    if not job.data_marker.exists():
+    if STAGE_INPUTS and not job.data_marker.exists():
         return 'data'
     if not job.external and not (job.work / 'train.done').exists():
         return 'train'
@@ -647,6 +650,10 @@ class StopRequested(RuntimeError):
 
 
 def stage_pretrained(interrupted):
+    if not STAGE_INPUTS:
+        if not checkpoint_source_healthy():
+            raise MountUnavailable(f'CROWN checkpoint inaccessible: {REMOTE_CKPT}')
+        return
     if LOCAL_CKPT.is_file():
         local_size = LOCAL_CKPT.stat().st_size
         if (LOCAL_CKPT_VERIFIED.is_file() and
@@ -660,7 +667,7 @@ def stage_pretrained(interrupted):
         except (OSError, zipfile.BadZipFile):
             pass
     if not checkpoint_source_healthy():
-        raise MountUnavailable('sshfs unavailable while staging CROWN weights')
+        raise MountUnavailable('NAS unavailable while staging CROWN weights')
     try:
         result = timed_run(
             ['stat', '-Lc', '%s', str(REMOTE_CKPT)], 8,
@@ -695,11 +702,11 @@ def stage_pretrained(interrupted):
                     os.killpg(process.pid, signal.SIGKILL)
                 if stopped:
                     raise StopRequested('CROWN weight staging stopped')
-                raise MountUnavailable('CROWN weight staging made no progress for 180 seconds; check sshfs')
+                raise MountUnavailable('CROWN weight staging made no progress for 180 seconds; check NAS')
             time.sleep(5)
         if process.returncode:
             if not checkpoint_source_healthy():
-                raise MountUnavailable('sshfs disconnected during CROWN weight staging')
+                raise MountUnavailable('NAS disconnected during CROWN weight staging')
             raise RuntimeError(f'CROWN weight rsync failed ({process.returncode}); see {log.name}')
     if partial.stat().st_size != remote_size:
         raise RuntimeError('Staged CROWN checkpoint size does not match the NAS source')
@@ -773,7 +780,7 @@ def main_controller(rows):
                 if code:
                     if log_reports_mount_error(job.work / f'{phase}.log', log_start) or not mount_healthy():
                         update(rows, job, status='paused_mount', phase=phase,
-                               message='sshfs I/O error; resume after mount is stable')
+                               message='NAS I/O error; resume after mount is stable')
                         mount_broken = True
                         break
                     update(rows, job, status='failed', phase=phase,
@@ -937,8 +944,8 @@ def main_controller(rows):
         if reason == 'paused_mount':
             for job in JOBS:
                 if rows[job.key]['status'] == 'queued':
-                    update(rows, job, status='paused_mount', message='sshfs unavailable')
-        if all(rows.get(job.key, {}).get('status') == 'complete' for job in JOBS):
+                    update(rows, job, status='paused_mount', message='NAS unavailable')
+        if STAGE_INPUTS and all(rows.get(job.key, {}).get('status') == 'complete' for job in JOBS):
             LOCAL_CKPT.unlink(missing_ok=True)
             LOCAL_CKPT_VERIFIED.unlink(missing_ok=True)
         print(f'Controller ended: {reason}')
@@ -977,11 +984,10 @@ def main():
         return
     rows = load_rows()
     if args.action in ('prepare', 'start'):
-        detect_mount_layout()
         try:
             rows = prepare(rows)
         except RuntimeError as exc:
-            if 'sshfs' not in str(exc):
+            if not isinstance(exc, MountUnavailable):
                 raise
             for job in JOBS:
                 if job.key in rows and rows[job.key]['status'] != 'complete':
@@ -990,6 +996,7 @@ def main():
             print(str(exc), file=sys.stderr)
             raise SystemExit(75)
     if args.action == 'start':
+        validate_runtime()
         main_controller(rows)
     else:
         print_status(rows)

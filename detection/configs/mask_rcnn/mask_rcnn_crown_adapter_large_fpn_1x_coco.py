@@ -1,5 +1,8 @@
 """CROWN ViT-L/16 Mask R-CNN template; replace dataset settings for each cohort."""
 
+import os
+from pathlib import Path
+
 _base_ = [
     '../_base_/models/mask_rcnn_r50_fpn.py',
     '../_base_/datasets/coco_instance.py',
@@ -7,8 +10,11 @@ _base_ = [
     '../_base_/default_runtime.py',
 ]
 
-pretrained = '/homes/rliuar/work/mnt/nas6/Cytology/Private/temp/X_Ckpts/crown_ckpts/CROWN.pth'
-official_root = '/homes/rliuar/work/0_Official/CROWN'
+pretrained = os.environ.get(
+    'CROWN_PRETRAINED_CKPT', '/jhcnas6/Private/temp/X_Ckpts/crown_ckpts/CROWN.pth')
+official_root = os.environ.get('CROWN_OFFICIAL_ROOT', str(Path.home() / '0_Official/CROWN'))
+# MMCV treats remaining module globals as config values.
+del os, Path
 
 model = dict(
     backbone=dict(
