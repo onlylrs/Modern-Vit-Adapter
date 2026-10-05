@@ -31,7 +31,7 @@ REMOTE_CKPT = Path(os.environ.get(
     'CROWN_PRETRAINED_CKPT',
     MOUNTPOINT / 'Private/temp/X_Ckpts/crown_ckpts/CROWN.pth')).expanduser()
 STAGE_INPUTS = os.environ.get('CROWN_STAGE_INPUTS', '0') == '1'
-LOCAL_CKPT = LOCAL / 'pretrained/CROWN.pth' if STAGE_INPUTS else REMOTE_CKPT
+LOCAL_CKPT = ARCHIVE / '_pretrained/CROWN.pth' if STAGE_INPUTS else REMOTE_CKPT
 LOCAL_CKPT_VERIFIED = LOCAL_CKPT.with_suffix('.verified')
 OFFICIAL_ROOT = Path(os.environ.get(
     'CROWN_OFFICIAL_ROOT', Path.home() / '0_Official/CROWN')).expanduser()
@@ -62,7 +62,7 @@ class Job:
 
     @property
     def work(self):
-        return LOCAL / self.task / self.dataset
+        return self.archive
 
     @property
     def config(self):
@@ -153,8 +153,8 @@ def validate_runtime():
             'check the driver/device access or set CROWN_GPUS')
     if not (OFFICIAL_ROOT / 'models/vision_transformer.py').is_file():
         raise FileNotFoundError(f'CROWN official source not found: {OFFICIAL_ROOT}')
-    if shutil.which('rsync') is None:
-        raise RuntimeError('rsync is required for checkpoint archiving')
+    if STAGE_INPUTS and shutil.which('rsync') is None:
+        raise RuntimeError('rsync is required for input staging')
     result = timed_run(['mkdir', '-p', str(ARCHIVE)], 10,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode:
@@ -371,16 +371,24 @@ def stage_archive(job):
         .replace(str(LOCAL_CKPT), str(REMOTE_CKPT))
         .replace(str(job.data / 'Public'), str(PUBLIC)),
         encoding='utf-8')
-    retry_resumable_copy([
-        'rsync', '-a', '--no-owner', '--no-group', '--no-perms', '--omit-dir-times',
-        '--partial', '--append-verify', '--delete-excluded',
-        '--exclude=sync.log', '--exclude=*.pth',
-        str(job.work) + '/', str(job.archive) + '/'])
+    # Training and evaluation already write into the final NAS directory.
+    # Copying it onto itself with --delete-excluded would delete checkpoints.
     if not job.external:
-        selected = best_checkpoint(job)
-        retry_resumable_copy([
-            'rsync', '--partial', '--append-verify',
-            str(selected), str(job.archive / selected.name)])
+        best_checkpoint(job)
+
+
+def cleanup_checkpoints(job):
+    """Keep the selected NAS checkpoint, including TXL-PBC for CBC testing."""
+    if job.external:
+        # CBC references TXL-PBC's persistent checkpoint through a symlink.
+        for ckpt in job.work.glob('best_*.pth'):
+            if ckpt.is_symlink():
+                ckpt.unlink()
+        return
+    selected = best_checkpoint(job)
+    for ckpt in job.work.glob('*.pth'):
+        if ckpt != selected:
+            ckpt.unlink()
 
 
 def render_config(job, splits, classes):
@@ -562,7 +570,7 @@ def best_checkpoint(job):
             path.name))
 
     if job.external:
-        # Retain the source checkpoint locally until CBC's external test ends.
+        # CBC uses TXL-PBC's persistent best checkpoint on NAS.
         parent = BY_KEY['det_txl_pbc']
         local_best = newest_best(parent.work.glob('best_*.pth'))
         if local_best:
@@ -809,18 +817,7 @@ def main_controller(rows):
                 else:
                     archived_best = (rows[BY_KEY['det_txl_pbc'].key]['best_ckpt'] if job.external
                                      else job.archive / best_checkpoint(job).name)
-                    if not job.external:
-                        for ckpt in job.work.glob('*.pth'):
-                            if (job.key == 'det_txl_pbc' and ckpt.name.startswith('best_')
-                                    and rows[BY_KEY['det_cbc'].key]['status'] != 'complete'):
-                                continue
-                            ckpt.unlink()
-                    else:
-                        for ckpt in job.work.glob('best_*.pth'):
-                            if ckpt.is_symlink():
-                                ckpt.unlink()
-                        for ckpt in BY_KEY['det_txl_pbc'].work.glob('best_*.pth'):
-                            ckpt.unlink()
+                    cleanup_checkpoints(job)
                     update(rows, job, status='complete', phase='done',
                            best_ckpt=archived_best, message='archived on NAS')
                     shutil.rmtree(job.data, ignore_errors=True)

@@ -57,8 +57,8 @@ Default paths on this machine:
 | COCO datasets | `/jhcnas6/Public` | `CROWN_PUBLIC_ROOT` |
 | Pretrained weights | `/jhcnas6/Private/temp/X_Ckpts/crown_ckpts/CROWN.pth` | `CROWN_PRETRAINED_CKPT` |
 | Official CROWN source | `~/0_Official/CROWN` | `CROWN_OFFICIAL_ROOT` |
-| NAS archive | `/jhcnas6/Cytology/smartcyto_baseline/crown` | `CROWN_ARCHIVE_ROOT` |
-| Local training, evaluation, logs | `<repo>/work_dirs/crown_runs` | `CROWN_LOCAL_ROOT` |
+| NAS training, evaluation, logs and checkpoints | `/jhcnas6/Cytology/smartcyto_baseline/crown` | `CROWN_ARCHIVE_ROOT` |
+| Optional dataset staging | `<repo>/work_dirs/crown_runs/data` | `CROWN_LOCAL_ROOT` |
 | Generated configs and progress CSVs | `<repo>/work_dirs/crown_pipeline` | `CROWN_STATE_ROOT` |
 
 `CROWN_MOUNTPOINT` changes the default NAS root (`/jhcnas6`). Individual path
@@ -66,8 +66,8 @@ variables take precedence. The templates also honor `CROWN_PRETRAINED_CKPT`
 and `CROWN_OFFICIAL_ROOT` when launched manually.
 
 `prepare` only needs readable datasets. Before `start` launches experiments,
-the runner checks CUDA device availability, official source, rsync, and NAS
-archive permissions. The current archive parent must be accessible and
+the runner checks CUDA device availability, official source, and NAS
+output permissions (plus rsync when input staging is enabled). The current archive parent must be accessible and
 writable by your account. If it is restricted, fix its permissions or set
 `CROWN_ARCHIVE_ROOT` to an accessible destination before starting.
 
@@ -76,18 +76,24 @@ NAS by default. It loads pretrained tensors into CPU memory without memory
 mapping. Set `CROWN_STAGE_INPUTS=1` before `prepare` and `start` to retain the
 old resumable local staging mode for slower or unreliable storage. Use the
 same setting throughout a run. That mode copies the pretrained checkpoint to
-`<local>/pretrained/CROWN.pth`, verifies its ZIP CRC, and stages only the images
+`<archive>/_pretrained/CROWN.pth`, verifies its ZIP CRC, and stages only the images
 referenced in each dataset's COCO JSON. A separate CPU worker copies data,
 and removes staged inputs after successful archiving. The NAS source files
 are never removed.
 
 Progress is recorded in `status.csv` and `results.csv` under the state root.
 The latter contains one row per metric with its mean and 95% bootstrap
-interval. Checkpoint archiving uses a separate CPU worker, leaving GPU slots
-available for experiments. Resumable rsync transfers do not request NAS
-owner, group, or permission changes. Only the best validation checkpoint is
-archived; intermediate local checkpoints are removed after archiving succeeds.
-The TXL-PBC best checkpoint remains local until CBC's external test completes.
+interval. Training and evaluation write directly into
+`/jhcnas6/Cytology/smartcyto_baseline/crown/{det,seg}/<dataset>/` (or the
+corresponding `CROWN_ARCHIVE_ROOT` destination). All epoch, latest, and best
+checkpoints are saved there from the beginning; no training checkpoint is
+written to local disk. Logs, evaluation results and completion markers also
+live there. A separate CPU worker finalizes the saved config without copying
+the directory onto itself. After evaluation and finalization succeed, only
+the selected best checkpoint is retained; interrupted runs keep their latest
+checkpoint for resumption. TXL-PBC's best checkpoint remains on NAS permanently
+and CBC uses it for external testing. `CROWN_LOCAL_ROOT` only controls optional
+dataset staging, not training checkpoint storage.
 
 Faster R-CNN selects `bbox_mAP` on validation. Mask R-CNN selects AJI on
 validation. Both use the 1x schedule, validate each epoch, and stop after five
@@ -102,5 +108,4 @@ limit, independent of filesystem type. After three consecutive failures,
 active process groups stop and their rows become `paused_mount`. Restore NAS
 access and run `start` again; training resumes from `latest.pth` and completed
 stages are skipped. A failed task can also be retried with `start` after
-fixing its underlying issue. Archive retries retain local checkpoints until
-transfer succeeds.
+fixing its underlying issue. Failed finalization retains NAS checkpoints for retry.

@@ -36,7 +36,8 @@ class NativeNasTests(unittest.TestCase):
                 pipeline.stage_pretrained(lambda: False)
 
     def test_staging_remains_optional_and_external_jobs_skip_training(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(pipeline, 'LOCAL', Path(root)):
+        with tempfile.TemporaryDirectory() as root, patch.object(pipeline, 'LOCAL', Path(root) / 'local'), \
+                patch.object(pipeline, 'ARCHIVE', Path(root) / 'nas'):
             job = pipeline.BY_KEY['det_apcdata']
             external = pipeline.BY_KEY['det_cbc']
             with patch.object(pipeline, 'STAGE_INPUTS', False):
@@ -52,6 +53,34 @@ class NativeNasTests(unittest.TestCase):
                 job.data.mkdir(parents=True)
                 job.data_marker.touch()
                 self.assertEqual(pipeline.stage(job), 'sync')
+
+    def test_nas_finalization_preserves_best_and_never_copies_onto_itself(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(pipeline, 'ARCHIVE', Path(root) / 'nas'), \
+                patch.object(pipeline, 'LOCAL', Path(root) / 'local'):
+            job = pipeline.BY_KEY['det_txl_pbc']
+            job.work.mkdir(parents=True)
+            self.assertEqual(job.work, job.archive)
+            best = job.work / 'best_bbox_mAP_epoch_2.pth'
+            best.write_bytes(b'best model')
+            (job.work / 'epoch_2.pth').write_bytes(b'resume model')
+            (job.work / 'latest.pth').symlink_to('epoch_2.pth')
+            config = Path(root) / 'config.py'
+            config.write_text('model = dict()')
+            with patch.object(pipeline.Job, 'config', new_callable=lambda: property(lambda _: config)), \
+                    patch.object(pipeline, 'retry_resumable_copy') as copy:
+                pipeline.stage_archive(job)
+                copy.assert_not_called()
+            pipeline.cleanup_checkpoints(job)
+            self.assertEqual(best.read_bytes(), b'best model')
+            self.assertEqual(list(job.work.glob('*.pth')), [best])
+            external = pipeline.BY_KEY['det_cbc']
+            external.work.mkdir(parents=True)
+            (external.work / best.name).symlink_to(best)
+            pipeline.cleanup_checkpoints(external)
+            self.assertTrue(best.is_file())
+            self.assertEqual(list(external.work.glob('*.pth')), [])
+            self.assertFalse((Path(root) / 'local').exists())
 
     def test_worker_inherits_resolved_paths_and_staging_setting(self):
         with patch.object(pipeline, 'STAGE_INPUTS', False):
